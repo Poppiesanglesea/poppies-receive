@@ -120,8 +120,10 @@ async function supplierScreen() {
 function drawSup() {
   const q = (document.getElementById("sq").value || "").toLowerCase();
   const f = a => a.filter(n => n.toLowerCase().includes(q));
-  const u = f(SUP.usual), o = q ? f(SUP.others) : [];
-  document.getElementById("sup").innerHTML = [...u, ...o].slice(0, 40).map(n => `<button class="big" onclick='S.supplier=${JSON.stringify(n)};photoScreen()'>${esc(n)}</button>`).join("") ||
+  const u = f(SUP.usual), o = f(SUP.others);
+  const btn = n => `<button class="big" onclick='S.supplier=${JSON.stringify(n)};photoScreen()'>${esc(n)}</button>`;
+  const head = t => `<div style="grid-column:1/-1" class="muted">${t}</div>`;
+  document.getElementById("sup").innerHTML = (u.length || o.length) ? (u.length ? head("Usual for " + esc(S.dept)) + u.map(btn).join("") : "") + (o.length ? head("All other suppliers") + o.map(btn).join("") : "") :
     `<div class="note">Not found. Type more of the name, or tell Josh it's a new supplier — leave the invoice on his desk for now.</div>`;
 }
 
