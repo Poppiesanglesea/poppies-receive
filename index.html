@@ -231,12 +231,45 @@ async function scanFor(i) {
 function stopScan(){ try { scanCtl && scanCtl.stop(); } catch(e){} scanCtl = null; const o = document.getElementById("scanov"); if (o) o.remove(); }
 async function submitLines() {
   const m = document.getElementById("cmsg");
-  const live = LINES.filter(l => String(l.description||"").trim());
-  if (!live.length) { m.innerHTML = `<div class="note err">Nothing to send.</div>`; return; }
-  if (live.some(l => l.qty === "" || l.qty == null)) { m.innerHTML = `<div class="note">Every product needs how many arrived. Count it if the paperwork doesn't say.</div>`; return; }
-  document.getElementById("go").disabled = true; m.innerHTML = `<div class="spinner"></div>`;
-  const r = await api(`/receipts/${REC.id}/submit`, { method: "POST", body: JSON.stringify({ invoice_number: document.getElementById("inv").value, invoice_date: document.getElementById("dt").value, lines: live }) });
-  if (!r.ok) { m.innerHTML = `<div class="note err">${esc(r.body.error || "Couldn't send")}</div>`; document.getElementById("go").disabled = false; return; }
+  const live = LINES;
+  if (!live.length) { m.innerHTML = '<div class="note err">Nothing to send.</div>'; return; }
+  for (const [index, line] of live.entries()) {
+    const count = Number(line.qty);
+    const problem = !String(line.description ?? "").trim() ? "Enter a product name or remove this row."
+      : !Number.isFinite(count) || count <= 0 ? "Enter the quantity that arrived or remove this row." : "";
+    if (problem) {
+      m.innerHTML = '<div class="note err">Row ' + (index + 1) + ': ' + problem + '</div>';
+      return;
+    }
+  }
+  const go = document.getElementById("go");
+  if (go.disabled) return;
+  go.disabled = true;
+  m.innerHTML = '<div class="spinner"></div>';
+  const path = `/receipts/${REC.id}`;
+  try {
+    const r = await api(path + "/submit", { method: "POST", body: JSON.stringify({
+      invoice_number: document.getElementById("inv").value,
+      invoice_date: document.getElementById("dt").value, lines: live
+    }) });
+    if (!r.ok) {
+      if (r.status === 409) {
+        const current = await api(path);
+        if (current.ok && current.body.status === "submitted") {
+          S.receipt = null;
+          $('<h2>Already sent</h2><p>Check this delivery under Recent deliveries.</p><button class="primary" onclick="homeScreen()">Done</button>');
+          return;
+        }
+      }
+      m.innerHTML = `<div class="note err">${esc(r.body.error || "Couldn't send")}</div>`;
+      return;
+    }
+  } catch {
+    m.innerHTML = '<div class="note err">Couldn’t confirm delivery. Check the connection and tap Send again on this receipt.</div>';
+    return;
+  } finally {
+    go.disabled = false;
+  }
   S.receipt = null;
   $(`<h2>Sent ✓</h2><div class="note ok">${live.length} product${live.length>1?"s":""} sent for set-up.</div>
    <p>New products will be added to Square automatically. When this delivery shows <b>"in Square — print labels"</b> under Recent deliveries, print the shelf tags and plant labels from Square.</p>
