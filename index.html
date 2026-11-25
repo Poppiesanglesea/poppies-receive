@@ -88,7 +88,7 @@ async function itemsScreen(id) {
   $(`<h2>New products</h2><div class="spinner"></div>`);
   const r = await api(`/receipts/${id}/items`);
   const b = r.body || {}, lines = b.lines || [];
-  const lab = { created: "In Square", known: "Already in Square", skipped: "Not stock", needs_josh: "Waiting on Josh", failed: "Problem — Josh notified", pending: "Being set up", dry_run: "Test run only (not in Square)" };
+  const lab = { created: "In Square", known: "Already in Square", skipped: "Not stock", needs_josh: "Waiting on Josh", failed: "Problem — Josh notified", pending: "Being set up", dry_run: "Test run only (not in Square)", square_created: "In Square, linking pending" };
   $(`<h2>${esc(b.supplier)} · ${esc(b.department)}</h2>
    <p class="q">To print labels: in Square, go to Items, search each product below, tick them, then choose Print labels.</p>
    <div class="card"><table><thead><tr><th>Product</th><th>SKU</th><th>Price</th><th>Status</th></tr></thead><tbody>
@@ -117,7 +117,7 @@ async function setPrice(id) {
   m.innerHTML = r.ok ? `<div class="note ok">${esc(res.status === "created" ? "Created in Square." : res.status === "dry_run" ? "Test mode: recorded, not created in Square." : (res.status || "Done"))}</div>` : `<div class="note err">${esc(r.body.error || "Couldn't save")}</div>`;
 }
 function label(x){
-  if (x.status === "submitted") return ({pending:"being set up", done:"in Square — print labels", needs_josh:"waiting on Josh"})[x.setup_status] || "sent";
+  if (x.status === "submitted") return ({pending:"being set up", ready:"in Square — print labels", needs_josh:"waiting on Josh", failed:"problem — Josh notified", dry_run:"test run only (not in Square)", empty:"nothing new to set up"})[x.setup_status] || "sent";
   return ({reading:"being read", ready:"waiting for a check", error:"problem"})[x.status] || x.status;
 }
 
@@ -203,7 +203,7 @@ function linesScreen(rec) {
 }
 function drawLines() {
   document.getElementById("ln").innerHTML = LINES.map((l,i)=>`<tr>
-   <td><input value="${esc(l.description)}" onchange="LINES[${i}].description=this.value">${l.source!=="invoice"?`<span class="tag">${l.source}</span>`:""}</td>
+   <td><input value="${esc(l.description)}" onchange="LINES[${i}].description=this.value">${l.source!=="invoice"?`<span class="tag">${l.split_group ? "part of: " + esc(l.invoice_description||"") + (l.split_total!=null ? " (" + l.split_total + ")" : "") : l.source}</span>`:""}</td>
    <td><input inputmode="decimal" value="${esc(l.qty)}" onchange="LINES[${i}].qty=this.value"></td>
    <td><input value="${esc(l.unit)}" onchange="LINES[${i}].unit=this.value"></td>
    <td><input inputmode="decimal" value="${esc(l.unit_price)}" onchange="LINES[${i}].unit_price=this.value"></td>
@@ -212,7 +212,33 @@ function drawLines() {
    <input placeholder="Barcode" inputmode="numeric" value="${esc(l.barcode)}" onchange="LINES[${i}].barcode=this.value" style="font-size:14px;padding:6px;flex:1"><button class="secondary small" onclick="scanFor(${i})">Scan</button></div></td></tr>`).join("");
 }
 function addLine(){ LINES.push({ description:"", qty:"", unit:"", unit_price:"", source:"added", note:"", barcode:"" }); drawLines(); }
-function splitLine(i){ const l = LINES[i]; LINES.splice(i+1, 0, { description: l.description, invoice_description: l.invoice_description, qty: "", unit: l.unit, unit_price: l.unit_price, sku: l.sku, source: "split", note: "", barcode: "" }); drawLines(); }
+// Splitting an invoice line (e.g. "Assorted 140mm x 20") turns the original and its parts into one group.
+// The group keeps the invoice count as split_total; the parts' counts must add up to it (checked here and on the server).
+// No part carries the shared supplier code, and the server never maps or replays a split group onto one variety.
+let GROUP_SEQ = 0;
+function splitLine(i){
+  const l = LINES[i];
+  if (!l.split_group) {
+    const g = "g" + (++GROUP_SEQ);
+    l.split_group = g; l.split_total = l.qty === "" || l.qty == null ? null : Number(l.qty);
+    l.split_sku = l.sku || null; l.sku = null; l.source = "split"; l.qty = "";
+  }
+  LINES.splice(i+1, 0, { description: l.description, invoice_description: l.invoice_description, qty: "", unit: l.unit, unit_price: l.unit_price,
+    sku: null, split_sku: l.split_sku, split_group: l.split_group, split_total: l.split_total, source: "split", note: "", barcode: "" });
+  drawLines();
+}
+function groupProblems(lines){
+  const groups = {};
+  for (const l of lines) if (l.split_group) (groups[l.split_group] ||= []).push(l);
+  const out = [];
+  for (const [g, rows] of Object.entries(groups)) {
+    const sum = rows.reduce((a, r) => a + (Number(r.qty) || 0), 0);
+    if (rows.length < 2) out.push(`A split "${rows[0].invoice_description || rows[0].description}" has only one part — split it again or remove it.`);
+    else if (rows[0].split_total != null && Math.abs(sum - rows[0].split_total) > 1e-9)
+      out.push(`The parts of "${rows[0].invoice_description}" add up to ${sum}, but the paperwork says ${rows[0].split_total}. Fix the counts so they match.`);
+  }
+  return out;
+}
 
 // ---------- barcode scanner (camera)
 let ZX = null, scanCtl = null;
@@ -242,6 +268,8 @@ async function submitLines() {
       return;
     }
   }
+  const gp = groupProblems(live);
+  if (gp.length) { m.innerHTML = '<div class="note err">' + esc(gp[0]) + '</div>'; return; }
   const go = document.getElementById("go");
   if (go.disabled) return;
   go.disabled = true;
