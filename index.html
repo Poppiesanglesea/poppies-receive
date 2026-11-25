@@ -90,7 +90,7 @@ async function itemsScreen(id) {
   const b = r.body || {}, lines = b.lines || [];
   const lab = { created: "In Square", known: "Already in Square", skipped: "Not stock", needs_josh: "Waiting on Josh", failed: "Problem — Josh notified", pending: "Being set up", dry_run: "Test run only (not in Square)", square_created: "In Square, linking pending" };
   $(`<h2>${esc(b.supplier)} · ${esc(b.department)}</h2>
-   <p class="q">To print labels: in Square, go to Items, search each product below, tick them, then choose Print labels.</p>
+   ${b.setup_status === "ready" ? '<p class="q">To print labels: in Square, go to Items, search each new product below, tick it, then choose Print labels.</p>' : ""}
    <div class="card"><table><thead><tr><th>Product</th><th>SKU</th><th>Price</th><th>Status</th></tr></thead><tbody>
    ${lines.map(l => { const x = l.result || {}; return `<tr><td>${esc(x.item_name ? x.item_name + (x.variation_name && x.variation_name !== "Regular" ? " — " + x.variation_name : "") : (l.input||{}).description)}</td><td>${esc(l.sku || x.upc || "")}</td><td>${x.price != null ? "$" + Number(x.price).toFixed(2) : (l.status==="created" ? "at sale" : "")}</td><td class="muted">${esc(lab[l.status] || l.status)}</td></tr>`; }).join("")}
    </tbody></table></div><button class="primary" onclick="homeScreen()">Done</button>`);
