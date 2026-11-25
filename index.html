@@ -179,6 +179,7 @@ function checkScreen(rec) {
   const unc = (x.uncertain || []);
   $(`<h2>Check every line</h2><p class="q">Compare with the paper invoice. Fix anything wrong, then tick the line. Quantity = what actually arrived.</p>
   ${x.kind === "statement" ? `<div class="note err">This looks like a statement or delivery docket, not an invoice. Don't book it — tap Cancel.</div>` : ""}
+  ${x.duplicate_of ? `<div class="note err">This invoice number is already in the system. Don't book it again — tap Cancel, unless Josh says otherwise.</div>` : ""}
   ${unc.length ? `<div class="note">Claude wasn't sure about: ${unc.map(esc).join("; ")}</div>` : ""}
   <div class="card"><div class="row" style="margin:0">
     <div style="flex:1;min-width:180px"><span class="muted">Invoice number</span><input id="inv" value="${esc(x.invoice_number)}"></div>
