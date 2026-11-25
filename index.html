@@ -90,18 +90,21 @@ async function itemsScreen(id) {
   const b = r.body || {}, lines = b.lines || [];
   const lab = { created: "In Square", known: "Already in Square", skipped: "Not stock", needs_josh: "Waiting on Josh", failed: "Problem — Josh notified", pending: "Being set up", dry_run: "Test run only (not in Square)", square_created: "In Square, linking pending" };
   $(`<h2>${esc(b.supplier)} · ${esc(b.department)}</h2>
-   ${b.setup_status === "ready" ? '<p class="q">To print labels: in Square, go to Items, search each new product below, tick it, then choose Print labels.</p>' : ""}
+   ${b.setup_status === "awaiting_price" ? '<p class="q">Some products are waiting for Josh to set a price in Square — don\'t print labels for those yet. They can still be sold: Square will ask for the price at the register.</p>' : ""}
+   ${b.setup_status === "ready" || b.setup_status === "awaiting_price" ? '<p class="q">To print labels: in Square, go to Items, search each new product below, tick it, then choose Print labels.</p>' : ""}
    <div class="card"><table><thead><tr><th>Product</th><th>SKU</th><th>Price</th><th>Status</th></tr></thead><tbody>
-   ${lines.map(l => { const x = l.result || {}; return `<tr><td>${esc(x.item_name ? x.item_name + (x.variation_name && x.variation_name !== "Regular" ? " — " + x.variation_name : "") : (l.input||{}).description)}</td><td>${esc(l.sku || x.upc || "")}</td><td>${x.price != null ? "$" + Number(x.price).toFixed(2) : (l.status==="created" ? "at sale" : "")}</td><td class="muted">${esc(lab[l.status] || l.status)}</td></tr>`; }).join("")}
+   ${lines.map(l => { const x = l.result || {}; return `<tr><td>${esc(x.item_name ? x.item_name + (x.variation_name && x.variation_name !== "Regular" ? " — " + x.variation_name : "") : (l.input||{}).description)}</td><td>${esc(l.sku || x.upc || "")}</td><td>${x.price != null ? "$" + Number(x.price).toFixed(2) : (l.price_state === "awaiting" ? "not set yet" : l.status==="created" ? "at sale" : "")}</td><td class="muted">${esc(l.price_state === "awaiting" ? "In Square — waiting for a price, don't print a label" : l.price_state === "priced" ? "In Square — priced, print label" : (lab[l.status] || l.status))}</td></tr>`; }).join("")}
    </tbody></table></div><button class="primary" onclick="homeScreen()">Done</button>`);
 }
 
 // ---------- Josh: prices
 async function needsScreen() {
   $(`<h2>Waiting for a price</h2><div class="spinner"></div>`);
-  const r = await api("/owner/needs");
-  const rows = r.body || [];
-  $(`<h2>Waiting for a price</h2>${rows.length ? "" : `<p>Nothing waiting.</p>`}
+  const [r, a] = await Promise.all([api("/owner/needs"), api("/owner/awaiting")]);
+  const rows = r.body || [], aw = (a.ok && a.body) || [];
+  $(`<h2>Waiting for a price</h2>
+   ${aw.length ? `<h3>In Square at variable price — set the price in Square</h3><p class="muted">They're already selling (staff type the price at the register). Once you set a price in Square, it comes back to Supabase overnight and staff can print labels.</p><div class="card"><table><thead><tr><th>Product</th><th>Supplier</th><th>Cost ex GST</th><th>Days</th></tr></thead><tbody>${aw.map(x => `<tr><td>${esc(x.item || "")}${x.variation && x.variation !== "Regular" ? " — " + esc(x.variation) : ""}${x.sku ? `<div class="muted">${esc(x.sku)}</div>` : ""}</td><td>${esc(x.supplier)}</td><td>${x.unit_cost_ex != null ? "$" + Number(x.unit_cost_ex).toFixed(2) : "unknown"}</td><td>${esc(String(x.days_waiting ?? ""))}</td></tr>`).join("")}</tbody></table></div>` : ""}
+   ${rows.length ? `<h3>Needs checking</h3>` : aw.length ? "" : `<p>Nothing waiting.</p>`}
    ${rows.map(x => { const d = x.decision || {}, i = x.input || {}, dr = x.delivery_receipts || {};
      return `<div class="card"><b>${esc(d.item_name || i.description)}${d.variation_name && d.variation_name!=="Regular" ? " — " + esc(d.variation_name) : ""}</b>
      <div class="muted">${esc(dr.supplier)} · ${esc(dr.department)} · cost ex GST ${d.unit_cost_ex != null ? "$" + Number(d.unit_cost_ex).toFixed(2) : "unknown"}</div>
@@ -117,7 +120,7 @@ async function setPrice(id) {
   m.innerHTML = r.ok ? `<div class="note ok">${esc(res.status === "created" ? "Created in Square." : res.status === "dry_run" ? "Test mode: recorded, not created in Square." : (res.status || "Done"))}</div>` : `<div class="note err">${esc(r.body.error || "Couldn't save")}</div>`;
 }
 function label(x){
-  if (x.status === "submitted") return ({pending:"being set up", ready:"in Square — print labels", needs_josh:"waiting on Josh", failed:"problem — Josh notified", dry_run:"test run only (not in Square)", empty:"nothing new to set up"})[x.setup_status] || "sent";
+  if (x.status === "submitted") return ({pending:"being set up", ready:"in Square — print labels", awaiting_price:"in Square — some waiting for a price", needs_josh:"waiting on Josh", failed:"problem — Josh notified", dry_run:"test run only (not in Square)", empty:"nothing new to set up"})[x.setup_status] || "sent";
   return ({reading:"being read", ready:"waiting for a check", error:"problem"})[x.status] || x.status;
 }
 
