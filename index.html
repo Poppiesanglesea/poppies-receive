@@ -421,8 +421,10 @@ async function resolveOp(op, action) {
   if (action === "overwrite" && !(el && el.value.trim() !== "" && Number.isFinite(now))) {
     return afterAction({ ok: false, body: { error: "Enter the price the register shows now." } }, null);
   }
-  const res = await api(`/owner/price-ops/${op}/resolve`, { method: "POST", body: JSON.stringify({ action, register_now: action === "overwrite" ? now : null }) });
-  await afterAction(res, action === "skip" ? "Left as it is." : "Saved. Staff will see the tag button again; the register updates when they confirm.");
+  const known = el && el.value.trim() !== "" && Number.isFinite(now);
+  const res = await api(`/owner/price-ops/${op}/resolve`, { method: "POST", body: JSON.stringify({ action, register_now: known ? now : null }) });
+  await afterAction(res, action === "skip" ? "Register left as it is. If staff already changed the tag, they'll be asked to put it back."
+    : "Saved. Staff will see the tag button again; the register updates when they confirm.");
 }
 // One shelf-tag job: the main tag row, then one row per half/quarter tag in the same group (names and prices only).
 const PART_STATE = { applied: "✓ register updated", skipped: "left as is", blocked: "Josh to check", conflict: "Josh to check",
@@ -448,6 +450,12 @@ function tagCell(t) {
   if (t.apply_state === "applied") return `<span class="muted">✓ Register updated · ${who}</span>`;
   if (t.apply_state === "conflict") return `<span class="note err" style="display:inline-block;margin:0">Josh needs to check: the register price was changed elsewhere.</span>`;
   if (t.status === "kept" || t.apply_state === "kept") return `<span class="muted">Josh kept the register price — leave this tag</span>`;
+  if (t.apply_state === "restore") {
+    const back = [...(t.main && t.main.restore ? [{ ...t.main, name: (t.info || {}).name }] : []), ...(Array.isArray(t.parts) ? t.parts : []).filter(p => p.restore)];
+    return `<div class="note" style="margin:0 0 6px">Josh kept the register price. Put ${back.length === 1 ? "this tag" : "these tags"} back:<br>${back.map(o =>
+      `${esc(o.name || "Tag")} → <b>${o.restore_to == null ? "the price the register shows" : money(o.restore_to)}</b>`).join("<br>")}</div>
+      <button class="primary small" id="tag${t.id}" onclick="tickTag(${t.id})">Tag${back.length === 1 ? "" : "s"} put back — done</button>`;
+  }
   const parts = Array.isArray(t.parts) ? t.parts : [];
   if (t.apply_state === "partial") {
     const retryable = parts.some(p => ["failed", "ambiguous", "ready"].includes(p.state));

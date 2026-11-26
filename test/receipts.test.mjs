@@ -23,7 +23,8 @@ function world() {
       if (fail.update) return { data: null, error: { message: 'db down' } };
       const r = rows.get(id);
       if (!r || !cond.statuses.includes(r.status)) return { data: [], error: null };
-      if ('lastDispatchAt' in cond && (r.confirmed_payload?.upload?.last_dispatch_at ?? null) !== cond.lastDispatchAt) return { data: [], error: null };
+      if ('dispatchToken' in cond && (r.confirmed_payload?.upload?.dispatch_token ?? null) !== cond.dispatchToken) return { data: [], error: null };
+      if (fail.updateOnce && patch.status) { delete fail.updateOnce; return { data: null, error: { message: 'db down' } }; }
       Object.assign(r, clone(patch));
       return { data: [clone(r)], error: null };
     },
@@ -39,6 +40,9 @@ function world() {
     buildPdf: async (pages) => new Uint8Array([37, 80, 68, 70, pages.length, t % 251]),
     dispatch: async (r) => {
       calls.dispatch++; calls.last = r; log.push('dispatch');
+      if (fail.hold) { const h = fail.hold; delete fail.hold; return await h; }          // a slow reader call, resolved by the test
+      if (fail.timeoutButQueued) { queue.add(r.source_id); return { ok: false, status: 504, body: { error: 'gateway timeout' } }; }
+      if (fail.already) return { ok: true, status: 200, body: { status: 'already_queued' } };
       if (fail.dispatch) return { ok: false, status: 503, body: {} };
       if (!fail.lose) queue.add(r.source_id);
       return { ok: true, status: 202, body: { status: 'accepted' } };
@@ -185,4 +189,59 @@ test('re-dispatch stops after 5 attempts; older receipts without upload details 
   const before = w.calls.dispatch;
   await reconcileReceipt(w.deps, legacy);
   assert.equal(w.calls.dispatch, before);
+});
+
+test('a late answer from an older dispatch attempt never overwrites the newer attempt', async () => {
+  const w = world(), op = randomUUID();
+  let release; w.fail.hold = new Promise((r) => { release = r; });
+  const first = createReceipt(w.deps, body(op));                        // attempt A is waiting on a slow reader
+  await new Promise((r) => setImmediate(r));
+  w.advance(181_000);
+  await reconcileReceipt(w.deps, w.rows.get(op));                       // attempt B (no queue row after 3 minutes)
+  assert.equal(w.rows.get(op).confirmed_payload.upload.dispatch, 'sent');
+  const tokenB = w.rows.get(op).confirmed_payload.upload.dispatch_token;
+  release({ ok: false, status: 503, body: {} });                        // A finally fails
+  const a = await first;
+  assert.equal(w.rows.get(op).status, 'reading', 'B result kept');
+  assert.equal(w.rows.get(op).confirmed_payload.upload.dispatch_token, tokenB);
+  assert.equal(a.body.id, op); assert.notEqual(a.status, 502);
+});
+
+test('a failed outcome write is reported, and nothing is re-sent while the reader has it', async () => {
+  const w = world(), op = randomUUID();
+  w.fail.updateOnce = true;                                             // the 'uploading' -> 'reading' move fails once
+  const r0 = await createReceipt(w.deps, body(op));
+  assert.equal(r0.status, 500);
+  const r1 = await createReceipt(w.deps, body(op));                     // resume: move ok, dispatch ok
+  assert.equal(r1.status, 202);
+  const w2 = world(), op2 = randomUUID();
+  await createReceipt(w2.deps, body(op2));
+  w2.fail.updateOnce = true;
+  w2.rows.get(op2).status = 'error'; w2.rows.get(op2).confirmed_payload.upload.dispatch = 'failed';
+  w2.queue.clear(); w2.advance(61_000);
+  const before = w2.calls.dispatch;
+  const r2 = await createReceipt(w2.deps, body(op2));                   // forced re-send; outcome write fails
+  assert.equal(r2.status, 500); assert.match(r2.body.error, /couldn't be recorded/);
+  assert.equal(w2.calls.dispatch, before + 1);
+  await reconcileReceipt(w2.deps, w2.rows.get(op2));                    // reader queued it: no further dispatch
+  assert.equal(w2.calls.dispatch, before + 1);
+});
+
+test('a timed-out dispatch that the reader actually accepted is not sent again', async () => {
+  const w = world(), op = randomUUID();
+  w.fail.timeoutButQueued = true;
+  const r = await createReceipt(w.deps, body(op));
+  assert.equal(r.status, 502); assert.equal(w.rows.get(op).status, 'error');
+  delete w.fail.timeoutButQueued; w.advance(61_000);
+  const rec = await reconcileReceipt(w.deps, w.rows.get(op));
+  assert.equal(rec.status, 'reading'); assert.equal(w.calls.dispatch, 1);
+  const again = await createReceipt(w.deps, body(op));                  // staff re-send: still not sent twice
+  assert.equal(again.body.id, op); assert.equal(w.calls.dispatch, 1);
+});
+
+test("the reader's 'already_queued' answer counts as accepted", async () => {
+  const w = world(), op = randomUUID();
+  w.fail.already = true;
+  const r = await createReceipt(w.deps, body(op));
+  assert.equal(r.status, 202); assert.equal(w.rows.get(op).status, 'reading');
 });

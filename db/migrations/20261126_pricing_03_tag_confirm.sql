@@ -39,6 +39,8 @@
 --    PENDING proposal leaves them: the register still shows that price until Josh decides.)
 --  * Operations are always read through the task's CURRENT proposal (a reused tag row keeps older revisions' operations
 --    as history only).
+--  * When Josh leaves a register price as it is (skip) after staff already confirmed the group, the job asks staff to put
+--    that physical tag back to the register price ('restore'), and closes when they confirm it. No register write.
 --  * Staff never see Square ids: the list gives each half/quarter's name, unit, old and new price and its state.
 --  * Test isolation: price_square_get/put call pg_temp.square_mock_get/put when the session defines them (the test
 --    harness does); otherwise they call Square through square_api.
@@ -86,7 +88,7 @@ alter table public.delivery_tasks add constraint delivery_tasks_status_check
 alter table public.delivery_tasks
   add column if not exists price_mode text check (price_mode in ('tag_only','apply_on_confirm')),
   add column if not exists proposal_id bigint references public.retail_price_proposal(id),
-  add column if not exists apply_state text check (apply_state in ('ready','applying','applied','partial','failed','conflict','superseded','kept')),
+  add column if not exists apply_state text check (apply_state in ('ready','applying','applied','partial','failed','conflict','superseded','kept','restore')),
   add column if not exists claim_token uuid,
   add column if not exists claimed_at timestamptz,
   add column if not exists attempts integer not null default 0,
@@ -383,7 +385,7 @@ end $$;
 -- 6) job state from its operations
 create or replace function public.price_task_settle(p_task_id bigint, p_by text)
 returns jsonb language plpgsql set search_path to 'public', 'pg_temp' as $$
-declare t delivery_tasks%rowtype; v_main text; v_done boolean; v_josh boolean; v_retry boolean; v_sum jsonb;
+declare t delivery_tasks%rowtype; v_main text; v_done boolean; v_josh boolean; v_retry boolean; v_sum jsonb; v_restore boolean;
 begin
   select * into t from delivery_tasks where id = p_task_id;
   select state into v_main from price_apply_op where task_id = t.id and proposal_id = t.proposal_id and role = 'main';
@@ -393,8 +395,21 @@ begin
   select jsonb_build_object('ops', coalesce(jsonb_agg(jsonb_build_object('role', role, 'name', label->>'name', 'state', state) order by role, id), '[]'))
     into v_sum from price_apply_op where task_id = t.id and proposal_id = t.proposal_id;
 
+  select exists (select 1 from price_apply_op where task_id = t.id and proposal_id = t.proposal_id and state = 'skipped'
+                   and coalesce((last_result->>'restore_needed')::boolean, false) and not coalesce((last_result->>'restore_done')::boolean, false))
+    into v_restore;
+
   if t.status <> 'open' then
     return jsonb_build_object('ok', t.status = 'done', 'status', t.status, 'register', case when t.status = 'done' then 'updated' end);
+  end if;
+  if v_restore and (v_main = 'skipped' or (v_main = 'applied' and v_done)) then
+    update delivery_tasks set apply_state = 'restore', claim_token = null, apply_result = v_sum where id = t.id;
+    return jsonb_build_object('ok', true, 'status', 'restore', 'register', case when v_main = 'skipped' then 'kept' else 'updated' end,
+                              'note', 'Josh kept the register price for a tag. Staff will see which tag to put back.');
+  end if;
+  if v_main = 'skipped' then
+    update delivery_tasks set status = 'kept', apply_state = 'kept', claim_token = null, done_by = p_by, done_at = now(), apply_result = v_sum where id = t.id;
+    return jsonb_build_object('ok', true, 'status', 'kept', 'register', 'kept');
   end if;
   if v_main = 'applied' and v_done then
     update retail_price_proposal set status = 'applied', applied_at = now(), square_result = v_sum where id = t.proposal_id and status = 'authorised';
@@ -444,6 +459,17 @@ begin
   if t.status <> 'open' then return jsonb_build_object('ok', false, 'status', t.status, 'error', 'This job is closed.'); end if;
   if t.apply_state = 'applying' and t.claimed_at > now() - interval '2 minutes' then
     return jsonb_build_object('ok', false, 'status', 'busy', 'error', 'Already being updated. Wait a moment, then check again.');
+  end if;
+  if t.apply_state = 'restore' then   -- staff confirm the kept tags are back at the register price (no register write)
+    insert into price_apply_audit (task_id, proposal_id, op_id, idem_key, source_id, stock_item_id, square_variation_id, expected_old, new_price, outcome, by)
+    select t.id, o.proposal_id, o.id, price_op_key(o.id, o.gen), t.source_id, o.stock_item_id, o.square_variation_id,
+           (o.last_result->>'restore_to')::numeric / 100.0, o.target_cents / 100.0, 'tag_restored', v_by
+      from price_apply_op o where o.task_id = t.id and o.proposal_id = t.proposal_id and o.state = 'skipped'
+       and coalesce((o.last_result->>'restore_needed')::boolean, false) and not coalesce((o.last_result->>'restore_done')::boolean, false);
+    update price_apply_op set last_result = last_result || jsonb_build_object('restore_done', true, 'restored_by', v_by), updated_at = now()
+     where task_id = t.id and proposal_id = t.proposal_id and state = 'skipped'
+       and coalesce((last_result->>'restore_needed')::boolean, false) and not coalesce((last_result->>'restore_done')::boolean, false);
+    return price_task_settle(t.id, v_by);
   end if;
   select * into q from retail_price_proposal where id = t.proposal_id;
   if not found or q.status <> 'authorised' then
@@ -531,7 +557,7 @@ end $$;
 --    (for the main price this withdraws the whole tag change: proposal rejected, job kept).
 create or replace function public.price_op_resolve(p_op_id bigint, p_action text, p_expected_cents integer DEFAULT NULL, p_by text DEFAULT 'Josh')
 returns jsonb language plpgsql security definer set search_path to 'public', 'extensions', 'pg_temp' as $$
-declare v_item bigint; o price_apply_op%rowtype; q retail_price_proposal%rowtype; v_by text := left(btrim(coalesce(p_by, 'Josh')), 40);
+declare v_item bigint; o price_apply_op%rowtype; q retail_price_proposal%rowtype; v_by text := left(btrim(coalesce(p_by, 'Josh')), 40); v_tagged boolean;
 begin
   select stock_item_id into v_item from price_apply_op where id = p_op_id;
   if not found then return jsonb_build_object('ok', false, 'error', 'Not found.'); end if;
@@ -546,14 +572,18 @@ begin
            last_result = coalesce(last_result, '{}') || jsonb_build_object('resolved', 'overwrite', 'by', v_by)
      where id = o.id;
   elsif p_action = 'skip' then
+    -- the register keeps its price. If staff already confirmed this group, they changed the physical tags first, so each
+    -- skipped tag gets a 'put it back' instruction with the register price (Josh's reading, else the last reading, else
+    -- the frozen expected price; unknown -> staff are told to check the register).
+    select attempts > 0 into v_tagged from delivery_tasks where id = o.task_id;
+    update price_apply_op x set state = 'skipped', claim_token = null, updated_at = now(),
+           last_result = coalesce(x.last_result, '{}') || jsonb_build_object('resolved', 'skip', 'by', v_by, 'restore_needed', v_tagged, 'restore_done', false,
+             'restore_to', case when x.id = o.id and p_expected_cents is not null then p_expected_cents
+                                else coalesce((x.last_result->>'square_cents')::int, x.expected_cents) end)
+     where x.task_id = o.task_id and x.proposal_id = o.proposal_id
+       and (x.id = o.id or (o.role = 'main' and x.state in ('ready', 'blocked', 'failed', 'conflict')));
     if o.role = 'main' then
-      update price_apply_op set state = 'skipped', claim_token = null, updated_at = now()
-       where task_id = o.task_id and proposal_id = o.proposal_id and state in ('ready', 'blocked', 'failed', 'conflict');
       update retail_price_proposal set status = 'rejected', decided_at = now(), decided_by = v_by, skip_reason = 'register price kept at confirm' where id = q.id;
-      update delivery_tasks set status = 'kept', apply_state = 'kept', claim_token = null, done_by = v_by, done_at = now() where id = o.task_id;
-    else
-      update price_apply_op set state = 'skipped', updated_at = now(), last_result = coalesce(last_result, '{}') || jsonb_build_object('resolved', 'skip', 'by', v_by)
-       where id = o.id;
     end if;
   else
     return jsonb_build_object('ok', false, 'error', 'Unknown action.');
@@ -772,7 +802,7 @@ do $m$
 declare d text := pg_get_functiondef('public.delivery_tasks_list()'::regprocedure);
 begin
   d := replace(d, $q$'id', t.id, 'kind', t.kind, 'status', t.status,$q$,
-                  $q$'id', t.id, 'kind', t.kind, 'status', t.status, 'price_mode', coalesce(t.price_mode, case when t.kind = 'tag' then 'tag_only' end), 'apply_state', t.apply_state, 'apply_result', t.apply_result, 'parts', case when t.price_mode = 'apply_on_confirm' then (select coalesce(jsonb_agg(jsonb_build_object('op', o.id, 'name', o.label->>'name', 'per', o.label->>'per', 'old', round(o.expected_cents / 100.0, 2), 'new', round(o.target_cents / 100.0, 2), 'state', o.state, 'register_now', round((o.last_result->>'square_cents')::numeric / 100.0, 2)) order by o.id), '[]'::jsonb) from price_apply_op o where o.task_id = t.id and o.proposal_id = t.proposal_id and o.role = 'part') end, 'main', case when t.price_mode = 'apply_on_confirm' then (select jsonb_build_object('op', o.id, 'state', o.state, 'old', round(o.expected_cents / 100.0, 2), 'new', round(o.target_cents / 100.0, 2), 'register_now', round((o.last_result->>'square_cents')::numeric / 100.0, 2)) from price_apply_op o where o.task_id = t.id and o.proposal_id = t.proposal_id and o.role = 'main') end,$q$);
+                  $q$'id', t.id, 'kind', t.kind, 'status', t.status, 'price_mode', coalesce(t.price_mode, case when t.kind = 'tag' then 'tag_only' end), 'apply_state', t.apply_state, 'apply_result', t.apply_result, 'parts', case when t.price_mode = 'apply_on_confirm' then (select coalesce(jsonb_agg(jsonb_build_object('op', o.id, 'name', o.label->>'name', 'per', o.label->>'per', 'old', round(o.expected_cents / 100.0, 2), 'new', round(o.target_cents / 100.0, 2), 'state', o.state, 'register_now', round((o.last_result->>'square_cents')::numeric / 100.0, 2), 'restore', coalesce((o.last_result->>'restore_needed')::boolean, false) and not coalesce((o.last_result->>'restore_done')::boolean, false), 'restore_to', round((o.last_result->>'restore_to')::numeric / 100.0, 2)) order by o.id), '[]'::jsonb) from price_apply_op o where o.task_id = t.id and o.proposal_id = t.proposal_id and o.role = 'part') end, 'main', case when t.price_mode = 'apply_on_confirm' then (select jsonb_build_object('op', o.id, 'state', o.state, 'old', round(o.expected_cents / 100.0, 2), 'new', round(o.target_cents / 100.0, 2), 'register_now', round((o.last_result->>'square_cents')::numeric / 100.0, 2), 'restore', coalesce((o.last_result->>'restore_needed')::boolean, false) and not coalesce((o.last_result->>'restore_done')::boolean, false), 'restore_to', round((o.last_result->>'restore_to')::numeric / 100.0, 2)) from price_apply_op o where o.task_id = t.id and o.proposal_id = t.proposal_id and o.role = 'main') end,$q$);
   if d not like '%''price_mode''%' then raise exception 'delivery_tasks_list patch did not apply'; end if;
   execute d;
 end $m$;

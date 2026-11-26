@@ -2,9 +2,13 @@
 -- Function-level rollback: restores the six replaced functions from function_backup (label 'pre-tag-confirm-2026-11-26')
 -- and drops the functions 03 added. Financial-action evidence is KEPT: price_apply_op, price_apply_audit, the added
 -- proposal/task columns and status values all stay (the restored functions ignore them).
--- Refuses while any register update is in flight or in doubt ('applying' / 'ambiguous'): settle those first by
+-- Refuses while staff still have a tag to put back ('restore'), or while any register update is in flight or in doubt
+-- ('applying' / 'ambiguous'): settle those first by
 -- confirming again (which reads Square) or by Josh's decision, so no outcome is left unknown.
 do $guard$ begin
+  if exists (select 1 from public.delivery_tasks where apply_state = 'restore' and status = 'open') then
+    raise exception 'rollback refused: staff still have a shelf tag to put back (finish that job first)';
+  end if;
   if exists (select 1 from public.delivery_tasks where apply_state = 'applying')
      or exists (select 1 from public.price_apply_op where state in ('applying', 'ambiguous')) then
     raise exception 'rollback refused: a register update is in progress or its outcome is not yet confirmed';

@@ -204,8 +204,13 @@ insert into test_part_prices values (122, 'VARHALF122XXXXXXXXXXXX', 2.70), (123,
 select pg_temp.mx('insert into square (variation_id, cents) values (''VARHALF122XXXXXXXXXXXX'', 300), (''VARHALF123XXXXXXXXXXXX'', 300), (''VARHALF124XXXXXXXXXXXX'', 300), (''VARHALF125XXXXXXXXXXXX'', 300)');
 select pg_temp.cand(122, 5.40); select produce_price_items('inv-1', array[122::bigint], false);
 select pg_temp.confirm(pg_temp.task(122));
-select pg_temp.ok((price_op_resolve((select id from price_apply_op where task_id = pg_temp.task(122) and role = 'part'), 'skip', null, 'Josh')->'task'->>'status') = 'done',
-                  'B6 owner skip of an unknown-price half completes the job');
+select pg_temp.ok((price_op_resolve((select id from price_apply_op where task_id = pg_temp.task(122) and role = 'part'), 'skip', 300, 'Josh')->'task'->>'status') = 'restore',
+                  'B6 owner skip after staff changed the tags: staff asked to put the half tag back');
+select pg_temp.ok((select (p->>'restore')::boolean and (p->>'restore_to')::numeric = 3.00
+                     from jsonb_array_elements(delivery_tasks_list()) c, jsonb_array_elements(c->'tasks') t, jsonb_array_elements(t->'parts') p
+                    where (t->>'id')::bigint = pg_temp.task(122)), 'B6 list tells staff the register price to put back ($3.00)');
+select pg_temp.ok((pg_temp.confirm(pg_temp.task(122))->>'status') = 'done', 'B6 staff confirm the tag is back: job completes');
+select pg_temp.ok(exists (select 1 from price_apply_audit where task_id = pg_temp.task(122) and outcome = 'tag_restored'), 'B6 restore audited');
 select pg_temp.ok((select state = 'skipped' and expected_cents is null from price_apply_op where task_id = pg_temp.task(122) and role = 'part')
                   and pg_temp.mq('VARHALF122XXXXXXXXXXXX', 'puts') = 0, 'B6 half left as is, no price invented');
 -- B7 unknown-price half superseded by a newer price (blocked -> superseded is allowed)
@@ -233,8 +238,30 @@ select pg_temp.ok((select jsonb_array_length(t->'parts') = 1 and (t->'main'->>'n
                   'B8 list shows only the current revision');
 select pg_temp.confirm((select id from b8));
 select price_op_resolve((select id from price_apply_op where task_id = (select id from b8) and role = 'part' and state = 'blocked'), 'skip', null, 'Josh');
+select pg_temp.confirm((select id from b8));   -- tag put back
 select pg_temp.ok((select status = 'done' from delivery_tasks where id = (select id from b8)) and pg_temp.mq(pg_temp.v(125), 'cents') = 560,
                   'B8 job completes on the current revision (old superseded operations do not hold it open)');
+-- B9 main price changed elsewhere, Josh keeps the register price: staff put the main AND half tags back; no writes
+select pg_temp.cand(127, 5.40); insert into square_variation_identity values ('VARHALF127XXXXXXXXXXXX', 'Synthetic produce 27', 'Half');
+insert into retail_part_variation_price values ('VARHALF127XXXXXXXXXXXX', 127, 2.50); insert into test_part_prices values (127, 'VARHALF127XXXXXXXXXXXX', 2.70);
+select pg_temp.mx('insert into square (variation_id, cents) values (''VARHALF127XXXXXXXXXXXX'', 250)');
+select produce_price_items('inv-1', array[127::bigint], false);
+select pg_temp.mx('update square set cents = 520 where variation_id = ''VARSYNTH0000000000000027''');
+select pg_temp.confirm(pg_temp.task(127));
+select pg_temp.ok((select apply_state = 'conflict' from delivery_tasks where id = pg_temp.task(127)), 'B9 (setup) conflict');
+select pg_temp.ok((price_op_resolve((select id from price_apply_op where task_id = pg_temp.task(127) and role = 'main'), 'skip', 520, 'Josh')->'task'->>'status') = 'restore',
+                  'B9 keep after confirm asks staff to restore tags');
+select pg_temp.ok((select (t->'main'->>'restore_to')::numeric = 5.20 and (t->'parts'->0->>'restore_to')::numeric = 2.50
+                     from jsonb_array_elements(delivery_tasks_list()) c, jsonb_array_elements(c->'tasks') t where (t->>'id')::bigint = pg_temp.task(127)),
+                  'B9 main back to $5.20 (register), half back to $2.50');
+select pg_temp.confirm(pg_temp.task(127));
+select pg_temp.ok((select status = 'kept' from delivery_tasks where id = pg_temp.task(127)) and pg_temp.mq(pg_temp.v(127), 'puts') = 0
+                  and pg_temp.mq('VARHALF127XXXXXXXXXXXX', 'puts') = 0, 'B9 tags restored, job kept, no register writes');
+-- B10 Josh keeps before staff ever confirmed: nothing to put back, job closes as kept
+select pg_temp.cand(128, 5.40); select produce_price_items('inv-1', array[128::bigint], false);
+update price_apply_op set state = 'conflict' where task_id = pg_temp.task(128) and role = 'main';
+select pg_temp.ok((price_op_resolve((select id from price_apply_op where task_id = pg_temp.task(128) and role = 'main'), 'skip', null, 'Josh')->'task'->>'status') = 'kept',
+                  'B10 keep before any confirm: closed, no restore step');
 -- leave one authorised job with a blocked half open, for the rollback check
 select pg_temp.cand(126, 5.40); insert into square_variation_identity values ('VARHALF126XXXXXXXXXXXX', 'Synthetic produce 26', 'Half');
 insert into test_part_prices values (126, 'VARHALF126XXXXXXXXXXXX', 2.70); select produce_price_items('inv-1', array[126::bigint], false);

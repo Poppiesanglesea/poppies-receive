@@ -25,10 +25,11 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 import { PDFDocument } from "npm:pdf-lib@1.17.1";
 import { ConfigUnavailable, makeCfg, whoFromHeaders } from "./auth.ts";
 import { createReceipt, reconcileReceipt, type Deps, type Receipt } from "./receipts.ts";
+import { confirmTag, type RpcErr } from "./tags.ts";
 
 export const BUILD = "delivery-app v17 2026-11-26";
-// SOURCE_SHA is written by scripts/check-edge.mjs --write: sha-256 of index.ts (with this one line removed), auth.ts and receipts.ts.
-export const SOURCE_SHA = { index: "e2aa9d0adfe57e33434ce7631778c9db915ea3771370f68d897cd788d34bec44", auth: "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331", receipts: "e126d02d17e6b52743fbd022f847cf14270b47a437bcbddb7347f245814dec1f" };
+// SOURCE_SHA is written by scripts/check-edge.mjs --write: sha-256 of index.ts (with this one line removed), auth.ts, receipts.ts and tags.ts.
+export const SOURCE_SHA = { index: "ff22b83043c1d59df609af878380b271677834693922bf26c193761007d3c997", auth: "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331", receipts: "0bbd4a7723ef2f7b146ac729ab08c45034a4d6dd04fecb3ef6c1adf72f199afe", tags: "0866c0de5065b546c54c8211853388e3316ec5fa4d297f70f12f30c2ed340c3d" };
 
 const URL_ = Deno.env.get("SUPABASE_URL")!;
 const SB = createClient(URL_, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
@@ -57,8 +58,8 @@ const DEPS: Deps = {
   insertReceipt: async (row) => { const r = await SB.from("delivery_receipts").insert(row); return { error: r.error }; },
   updateReceipt: async (id, patch, cond) => {
     let q = SB.from("delivery_receipts").update(patch).eq("id", id).in("status", cond.statuses);
-    if ("lastDispatchAt" in cond) {
-      q = cond.lastDispatchAt == null ? q.is("confirmed_payload->upload->>last_dispatch_at", null) : q.eq("confirmed_payload->upload->>last_dispatch_at", cond.lastDispatchAt);
+    if ("dispatchToken" in cond) {
+      q = cond.dispatchToken == null ? q.is("confirmed_payload->upload->>dispatch_token", null) : q.eq("confirmed_payload->upload->>dispatch_token", cond.dispatchToken);
     }
     const r = await q.select(RCOLS);
     return { data: r.data as Receipt[] | null, error: r.error };
@@ -182,8 +183,9 @@ Deno.serve(async (req) => {
         const now = Number(b.register_now);
         if (!action) return json({ error: "Unknown action." }, 400);
         if (action === "overwrite" && !(Number.isFinite(now) && now >= 0 && now < 10000)) return json({ error: "Enter the price the register shows now." }, 400);
-        const { data, error } = await SB.rpc("price_op_resolve", { p_op_id: Number(pm[1]), p_action: action,
-          p_expected_cents: action === "overwrite" ? Math.round(now * 100) : null, p_by: "Josh" });
+        // skip: the register price Josh read (if given) is what staff put the tag back to
+        const cents = Number.isFinite(now) && b.register_now !== null && b.register_now !== "" && now >= 0 && now < 10000 ? Math.round(now * 100) : null;
+        const { data, error } = await SB.rpc("price_op_resolve", { p_op_id: Number(pm[1]), p_action: action, p_expected_cents: cents, p_by: "Josh" });
         if (error) return json({ error: error.code === "PGRST202" ? "Not available yet." : "Couldn't save. Try again." }, error.code === "PGRST202" ? 404 : 500);
         return json(data, data?.ok ? 200 : 400);
       }
@@ -266,19 +268,8 @@ Deno.serve(async (req) => {
         const names = (await cfg("delivery_staff_names")).split(",").map((n) => n.trim());
         if (!names.includes(by)) return json({ error: "Pick your name first." }, 400);
         if (tm[2] === "tick") {
-          // two transactions: the claim (with its audit + operation keys) commits before any register write
-          const c = await SB.rpc("delivery_tag_claim", { p_task_id: id, p_by: by });
-          if (c.error) {
-            // database without pricing_03 (no claim function), or the claim call failed: the single-call form is safe in
-            // both cases (before 03 it is today's tick; after 03 it is claim + apply in one transaction with the same keys)
-            const { data, error } = await SB.rpc("delivery_task_tick", { p_task_id: id, p_by: by });
-            if (error) return json({ error: error.message }, 500);
-            return json(data, data?.ok ? 200 : 400);
-          }
-          if (c.data?.phase !== "apply") return json(c.data, c.data?.ok ? 200 : 400);
-          const a = await SB.rpc("delivery_tag_apply", { p_task_id: id, p_token: c.data.token, p_by: by });
-          if (a.error) return json({ error: "The register update didn't finish. Wait two minutes, then tap again — it won't be changed twice.", status: "busy" }, 502);
-          return json(a.data, a.data?.ok ? 200 : 400);
+          const out = await confirmTag((fn, args) => SB.rpc(fn, args) as unknown as Promise<{ data: any; error: RpcErr }>, id, by);
+          return json(out.body, out.status);
         }
         const { data, error } = tm[2] === "tick"
           ? await SB.rpc("delivery_task_tick", { p_task_id: id, p_by: by })

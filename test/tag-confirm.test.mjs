@@ -102,3 +102,14 @@ test('Josh sees conflicting / unknown register prices and can resolve them (post
   const r = reqs.find(x => x.path === '/owner/price-ops/42/resolve');
   assert.ok(r, 'resolve request sent'); assert.equal(r.method, 'POST');
 });
+
+test('after Josh keeps a register price, staff are told which tags to put back and to what price', async () => {
+  const t = tag({ price_mode: 'apply_on_confirm', apply_state: 'restore', main: { op: 1, state: 'skipped', restore: true, restore_to: 5.2 },
+    parts: [{ op: 2, name: 'Pumpkin – Half', per: 'per kg', old: 2.5, new: 2.7, state: 'skipped', restore: true, restore_to: 2.5 },
+            { op: 3, name: 'Pumpkin – Quarter', per: 'per kg', old: null, new: 1.4, state: 'skipped', restore: true, restore_to: null }] });
+  const { ctx, el } = app([t]);
+  await settle(); await vm.runInContext('fetchDeliveries()', ctx); vm.runInContext('deliveryScreen("inv-1")', ctx);
+  const h = el('app').innerHTML;
+  assert.match(h, /Put these tags back/); assert.match(h, /Apples → <b>\$5\.20/); assert.match(h, /Pumpkin – Half → <b>\$2\.50/);
+  assert.match(h, /Pumpkin – Quarter → <b>the price the register shows/); assert.match(h, /Tags put back — done/);
+});

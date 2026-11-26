@@ -12,9 +12,14 @@
 //  * Every storage write and every row write is checked. A failure leaves the row 'upload_failed' (resumable) and
 //    returns an error; nothing is reported as received unless it is.
 //  * Only the request that moves the row 'uploading' -> 'reading' dispatches to the invoice reader.
+//  * Every dispatch attempt has its own token (confirmed_payload.upload.dispatch_token), claimed with an optimistic
+//    check on the previous token. An attempt records its outcome only if it is still the current attempt, so a late
+//    answer from an older attempt can never overwrite a newer one. A failed outcome write is reported, not ignored.
 //  * Dispatch reconciliation: a 'reading' receipt with no reader queue row after 3 minutes, or an 'error' receipt
-//    whose dispatch failed, is re-dispatched from the stored PDF with the same source_id (max 5 attempts, one at a
-//    time via an optimistic check on the last attempt time).
+//    whose dispatch failed, is re-dispatched from the stored PDF with the same source_id (max 5 attempts). Before any
+//    re-dispatch the reader queue is checked: a row there means the reader already has it (a timed-out call can still
+//    have been accepted), so the receipt is marked as being read instead. The invoice reader is idempotent per
+//    source_id once queued ('already_queued' / 'already_processed' count as accepted).
 
 export const DEPTS = ["Garden", "Grocer", "Gift Store"];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -29,13 +34,13 @@ export type Receipt = {
 };
 export type Upload = {
   fingerprint?: string; pages?: number; reserved_at?: string; dispatch?: "pending" | "sent" | "failed";
-  dispatch_attempts?: number; last_dispatch_at?: string | null; error?: string;
+  dispatch_attempts?: number; last_dispatch_at?: string | null; dispatch_token?: string | null; error?: string;
 };
 export type Deps = {
   getReceipt(id: string): Promise<{ data: Receipt | null; error: DbErr }>;
   insertReceipt(row: Partial<Receipt>): Promise<{ error: DbErr }>;
-  // update only when the row is still in one of `statuses` (and, if given, last_dispatch_at still equals `lastDispatchAt`)
-  updateReceipt(id: string, patch: Partial<Receipt>, cond: { statuses: string[]; lastDispatchAt?: string | null }): Promise<{ data: Receipt[] | null; error: DbErr }>;
+  // update only when the row is still in one of `statuses` (and, if given, upload.dispatch_token still equals `dispatchToken`)
+  updateReceipt(id: string, patch: Partial<Receipt>, cond: { statuses: string[]; dispatchToken?: string | null }): Promise<{ data: Receipt[] | null; error: DbErr }>;
   upload(path: string, bytes: Uint8Array, contentType: string): Promise<{ error: DbErr; exists?: boolean }>;
   download(path: string): Promise<{ data: Uint8Array | null; error: DbErr }>;
   queueRow(sourceId: string): Promise<{ data: unknown | null; error: DbErr }>;
@@ -131,9 +136,9 @@ async function finishUpload(d: Deps, rec: Receipt, pages: Uint8Array[]): Promise
     pdf = got.data;
   }
 
-  const now = d.now().toISOString();
+  const now = d.now().toISOString(), token = d.uuid();
   const moved = await d.updateReceipt(rec.id, { status: "reading", photo_paths: paths, hold_reason: null,
-    confirmed_payload: withUpload(rec, { dispatch: "pending", last_dispatch_at: now, dispatch_attempts: (upl(rec).dispatch_attempts ?? 0) + 1, error: undefined }) },
+    confirmed_payload: withUpload(rec, { dispatch: "pending", last_dispatch_at: now, dispatch_token: token, dispatch_attempts: (upl(rec).dispatch_attempts ?? 0) + 1, error: undefined }) },
     { statuses: RESUMABLE });
   if (moved.error) return { status: 500, body: { error: "Couldn't save the delivery. Try again." } };
   if (!moved.data?.length) {   // another request finished this send first; it does the dispatch
@@ -141,20 +146,31 @@ async function finishUpload(d: Deps, rec: Receipt, pages: Uint8Array[]): Promise
     if (cur.error || !cur.data) return { status: 500, body: { error: "Couldn't save the delivery. Try again." } };
     return received(cur.data, 202);
   }
-  return dispatchOnce(d, moved.data[0], pdf, 202);
+  return dispatchOnce(d, moved.data[0], pdf, 202, token);
 }
 
-async function dispatchOnce(d: Deps, rec: Receipt, pdf: Uint8Array, okCode: number): Promise<Out> {
+const ACCEPTED = ["accepted", "already_queued", "already_processed"];
+
+// One dispatch attempt; its outcome is recorded only while `token` is still the receipt's current attempt.
+async function dispatchOnce(d: Deps, rec: Receipt, pdf: Uint8Array, okCode: number, token: string): Promise<Out> {
   let r: { ok: boolean; status: number; body: unknown };
   try { r = await d.dispatch({ source_id: rec.source_id, supplier: rec.supplier, department: rec.department, pdf }); }
   catch (e) { r = { ok: false, status: 0, body: String((e as Error).message ?? e) }; }
-  const accepted = r.ok && (r.body as { status?: string } | null)?.status === "accepted";
-  if (accepted) {
-    await d.updateReceipt(rec.id, { status: "reading", hold_reason: null, confirmed_payload: withUpload(rec, { dispatch: "sent" }) }, { statuses: ["reading", "error"] });
-    return { status: okCode, body: { id: rec.id, status: "reading" } };
-  }
+  const accepted = r.ok && ACCEPTED.includes(String((r.body as { status?: string } | null)?.status));
   const why = `reader: ${r.status} ${JSON.stringify(r.body).slice(0, 200)}`;
-  await d.updateReceipt(rec.id, { status: "error", hold_reason: why, confirmed_payload: withUpload(rec, { dispatch: "failed" }) }, { statuses: ["reading", "error"] });
+  const done = await d.updateReceipt(rec.id, accepted
+      ? { status: "reading", hold_reason: null, confirmed_payload: withUpload(rec, { dispatch: "sent" }) }
+      : { status: "error", hold_reason: why, confirmed_payload: withUpload(rec, { dispatch: "failed" }) },
+    { statuses: ["reading", "error"], dispatchToken: token });
+  if (done.error) {
+    return { status: 500, body: { id: rec.id, error: "The photos are saved, but the hand-off to the invoice reader couldn't be recorded. It is checked again automatically." } };
+  }
+  if (!done.data?.length) {   // a newer attempt took over while this one was waiting: its result stands
+    const cur = await d.getReceipt(rec.id);
+    if (cur.error || !cur.data) return { status: 500, body: { id: rec.id, error: "Couldn't check the delivery. Try again." } };
+    return received(cur.data, okCode);
+  }
+  if (accepted) return { status: okCode, body: { id: rec.id, status: "reading" } };
   return { status: 502, body: { id: rec.id, status: "error", reason: "The invoice reader is not available right now. The photo is saved and will be sent again automatically." } };
 }
 
@@ -162,16 +178,29 @@ async function dispatchOnce(d: Deps, rec: Receipt, pdf: Uint8Array, okCode: numb
 async function redispatch(d: Deps, rec: Receipt, force = false): Promise<Out> {
   const u = upl(rec);
   const attempts = u.dispatch_attempts ?? 0;
-  if (attempts >= MAX_DISPATCH) return received(rec);
-  const last = u.last_dispatch_at ?? rec.created_at ?? null;
   const wait = REDISPATCH_AFTER_MS[rec.status as "reading" | "error"];
-  if (!force && (wait === undefined || (last && d.now().getTime() - Date.parse(last) < wait))) return received(rec);
-  const claim = await d.updateReceipt(rec.id, { confirmed_payload: withUpload(rec, { last_dispatch_at: d.now().toISOString(), dispatch_attempts: attempts + 1 }) },
-    { statuses: [rec.status], lastDispatchAt: u.last_dispatch_at ?? null });
+  if (wait === undefined) return received(rec);
+  const last = u.last_dispatch_at ?? rec.created_at ?? null;
+  if (!force && last && d.now().getTime() - Date.parse(last) < wait) return received(rec);
+  // the reader may already have it (e.g. the call timed out after it was accepted): never send it twice
+  const q = await d.queueRow(rec.source_id);
+  if (q.error) return received(rec);
+  if (q.data) {
+    if (rec.status === "error") {
+      await d.updateReceipt(rec.id, { status: "reading", hold_reason: null, confirmed_payload: withUpload(rec, { dispatch: "sent" }) },
+        { statuses: ["error"], dispatchToken: u.dispatch_token ?? null });
+    }
+    const cur = await d.getReceipt(rec.id);
+    return received(cur.data ?? rec, 202);
+  }
+  if (attempts >= MAX_DISPATCH) return received(rec);
+  const token = d.uuid();
+  const claim = await d.updateReceipt(rec.id, { confirmed_payload: withUpload(rec, { last_dispatch_at: d.now().toISOString(), dispatch_token: token, dispatch_attempts: attempts + 1 }) },
+    { statuses: [rec.status], dispatchToken: u.dispatch_token ?? null });
   if (claim.error || !claim.data?.length) return received(rec);   // another request is re-dispatching it
   const got = await d.download(`${dirOf(rec)}/invoice.pdf`);
   if (got.error || !got.data) return received(rec);
-  return dispatchOnce(d, claim.data[0], got.data, 202);
+  return dispatchOnce(d, claim.data[0], got.data, 202, token);
 }
 
 // Called when a receipt is looked at: re-dispatch a lost or failed reader hand-off. Returns the receipt as it now is.
@@ -180,11 +209,7 @@ export async function reconcileReceipt(d: Deps, rec: Receipt): Promise<Receipt> 
   const stuckReading = rec.status === "reading" && u.dispatch !== undefined;
   const failedDispatch = rec.status === "error" && u.dispatch === "failed";
   if (!stuckReading && !failedDispatch) return rec;
-  if (stuckReading) {
-    const q = await d.queueRow(rec.source_id);
-    if (q.error || q.data) return rec;   // the reader has it (or we can't tell): leave it
-  }
-  await redispatch(d, rec);
+  await redispatch(d, rec);   // checks the reader queue before sending anything
   const cur = await d.getReceipt(rec.id);
   return cur.data ?? rec;
 }

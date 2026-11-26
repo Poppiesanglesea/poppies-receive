@@ -1,13 +1,15 @@
 {
   "build": "delivery-app v17 2026-11-26",
   "source_sha": {
-    "index": "e2aa9d0adfe57e33434ce7631778c9db915ea3771370f68d897cd788d34bec44",
+    "index": "ff22b83043c1d59df609af878380b271677834693922bf26c193761007d3c997",
     "auth": "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331",
-    "receipts": "e126d02d17e6b52743fbd022f847cf14270b47a437bcbddb7347f245814dec1f"
+    "receipts": "0bbd4a7723ef2f7b146ac729ab08c45034a4d6dd04fecb3ef6c1adf72f199afe",
+    "tags": "0866c0de5065b546c54c8211853388e3316ec5fa4d297f70f12f30c2ed340c3d"
   },
   "file_sha256": {
-    "index.ts": "b979ee494380c7c09c02a51f2000d46830be2d48b25c17833e611b3556bc0358",
+    "index.ts": "0e015d41139671f3459b5dae68d222e71a5f24d643c6b1987d4993badc8e6458",
     "auth.ts": "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331",
-    "receipts.ts": "e126d02d17e6b52743fbd022f847cf14270b47a437bcbddb7347f245814dec1f"
+    "receipts.ts": "0bbd4a7723ef2f7b146ac729ab08c45034a4d6dd04fecb3ef6c1adf72f199afe",
+    "tags.ts": "0866c0de5065b546c54c8211853388e3316ec5fa4d297f70f12f30c2ed340c3d"
   }
 }

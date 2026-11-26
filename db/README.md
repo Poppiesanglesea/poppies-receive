@@ -25,7 +25,9 @@ pricing-maths view are explicit fixtures), applies 01 / 02 / 03 as single transa
 - `tests/pricing_03_concurrency.sh`: three sessions (slow confirm holding the item lock, newer invoice touching two items
   in reverse order, confirm on the other item): no deadlock, one write, correct supersede order;
 - 03 rollback guard and evidence-preserving rollback (`tests/pricing_03_rollback_checks.sql`).
-Last run (26 Nov 2026, rev 2b): provenance_02 8/8 + 4 rollback checks; pricing_03 76/76; concurrency 6/6; 03 rollback 2 + 9/9.
+Last run (26 Nov 2026, rev 2c): provenance_02 8/8 + 4 rollback checks; pricing_03 84/84; concurrency 6/6; 03 rollback 2 + 9/9.
+Rev 2c: when Josh leaves a register price as it is after staff already confirmed the group, the job asks staff to put
+those physical tags back to the register price ('restore'), then closes; rollback refuses while such a step is open.
 Rev 2b (after review of 49f251a): unknown-price halves can close as skipped/superseded without inventing a price
 (owner skip, newer price, Keep, rollback all tested); every job reads only its CURRENT proposal's operations when a
 delivery card is reused by a newer revision (tested); owner resolution is wired end to end — Edge
