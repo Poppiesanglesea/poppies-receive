@@ -46,7 +46,7 @@ tr.sub td{padding-top:0}
 </style>
 </head>
 <body>
-<header><h1>Poppie's · New stock</h1><button onclick="homeScreen()">Home</button></header>
+<header><h1>Poppie's · New stock &amp; deliveries</h1><button onclick="homeScreen()">Home</button></header>
 <main id="app"></main>
 <script>
 const API = "https://xcolpextsojdtbfscvse.supabase.co/functions/v1/delivery-app";
@@ -73,10 +73,11 @@ function noKey(){ $(`<h2>This iPad isn't set up yet</h2><p>Ask Josh to open the 
 let idleT; function idle(){ clearTimeout(idleT); idleT = setTimeout(() => { if (!S.receipt) homeScreen(); }, 15*60*1000); }
 async function homeScreen() {
   if (!KEY && !OWNER) return noKey();
-  S = { dept: S.dept, supplier: null, photos: [], receipt: null };
-  $(`<div id="own"></div><h2>New delivery</h2><p class="q">Which department is it for?</p>
+  S = { dept: S.dept, supplier: null, photos: [], receipt: null }; WHO = null;
+  $(`<div id="own"></div><div id="dlv"></div><h2>New delivery</h2><p class="q">Which department is it for?</p>
   <div class="grid">${DEPTS.map(d=>`<button class="big" onclick="S.dept='${d}';supplierScreen()">${d}</button>`).join("")}</div>
   <h2 style="margin-top:28px">Recent deliveries</h2><p class="muted" style="margin:-8px 0 6px">Tap one to see its new products and print labels.</p><div class="list" id="recent"><span class="muted">Loading…</span></div>`);
+  loadDeliveries();
   const r = await api("/recent");
   const items = (r.body && r.body.items) || [];
   document.getElementById("recent").innerHTML = items.map(x => `<div onclick="${x.status==='submitted'?`itemsScreen('${x.id}')`:''}" style="cursor:pointer"><span>${esc(x.supplier)} · ${esc(x.department)}</span><span class="muted">${esc(label(x))} · ${new Date(x.created_at).toLocaleDateString("en-AU",{day:"numeric",month:"short"})}</span></div>`).join("") || `<span class="muted">Nothing yet.</span>`;
@@ -122,6 +123,146 @@ async function setPrice(id) {
 function label(x){
   if (x.status === "submitted") return ({pending:"being set up", ready:"in Square — print labels", awaiting_price:"in Square — some waiting for a price", needs_josh:"waiting on Josh", failed:"problem — Josh notified", dry_run:"test run only (not in Square)", empty:"nothing new to set up"})[x.setup_status] || "sent";
   return ({reading:"being read", ready:"waiting for a check", error:"problem"})[x.status] || x.status;
+}
+
+// ---------- Deliveries: jobs from booked invoices (tags to change, boxes to count, Josh's price decisions)
+let DLV = { cards: [], staff: [], owner: false }, WHO = null;
+const money = (v) => v == null || v === "" ? "" : "$" + Number(v).toFixed(2);
+const jobs = (c, kinds) => (c.tasks || []).filter(t => kinds.includes(t.kind));
+const openJobs = (c, kinds) => jobs(c, kinds).filter(t => t.status === "open");
+const dday = (d) => d ? new Date(d + "T00:00:00").toLocaleDateString("en-AU", { weekday: "short", day: "numeric", month: "short" }) : "";
+const when = (d) => d ? new Date(d).toLocaleTimeString("en-AU", { hour: "numeric", minute: "2-digit" }) : "";
+function unitWord(u, n) {
+  u = String(u || "each").toLowerCase();
+  if (u === "kg") return "kg";
+  if (u === "bunch") return n === 1 ? "bunch" : "bunches";
+  if (u === "each" || u === "ea") return n === 1 ? "item" : "items";
+  return u;
+}
+async function fetchDeliveries() {
+  const r = await api("/deliveries");
+  if (r.ok) DLV = r.body; return r.ok;
+}
+async function loadDeliveries() {
+  const box = document.getElementById("dlv"); if (!box) return;
+  if (!(await fetchDeliveries())) return;
+  const open = DLV.cards.filter(c => openJobs(c, ["tag", "count"]).length);
+  const own = document.getElementById("own");
+  const josh = DLV.cards.reduce((n, c) => n + openJobs(c, ["hold", "noprice"]).length, 0);
+  if (DLV.owner && own) own.insertAdjacentHTML("afterbegin", `<div class="row" style="margin:0 0 10px"><button class="secondary" onclick="joshScreen()">Josh: price decisions${josh ? ` (${josh})` : ""}</button></div>`);
+  box.innerHTML = open.length ? `<h2>Deliveries to finish</h2><div class="grid" style="margin-bottom:24px">${open.map(c => {
+      const t = openJobs(c, ["tag"]).length, n = openJobs(c, ["count"]).length;
+      return `<button class="big" onclick="deliveryScreen('${esc(c.source_id)}')"><b>${esc(c.supplier)}</b><br><span class="muted">${esc(dday(c.invoice_date))}</span><br>${[t ? t + " tag" + (t > 1 ? "s" : "") : "", n ? n + " to count" : ""].filter(Boolean).join(" · ")}</button>`;
+    }).join("")}</div>` : "";
+}
+let PENDING = null;
+function pickName(then) {
+  if (WHO) return then();
+  PENDING = then;
+  $(`<h2>Who's doing this?</h2><p class="q">So Josh knows who checked it.</p><div class="grid">${(DLV.staff || []).map((n, i) => `<button class="big" onclick="nameChosen(${i})">${esc(n)}</button>`).join("")}</div>
+   <div class="row"><button class="secondary" onclick="deliveryScreen(S.delivery)">Back</button></div>`);
+}
+function nameChosen(i) { WHO = DLV.staff[i]; const f = PENDING; PENDING = null; if (f) f(); }
+function deliveryScreen(sid, msg) {
+  const c = DLV.cards.find(x => x.source_id === sid);
+  if (!c) return homeScreen();
+  S.delivery = sid; S.view = "delivery";
+  const tags = jobs(c, ["tag"]), counts = jobs(c, ["count"]), holds = jobs(c, ["hold", "noprice"]);
+  $(`<h2>${esc(c.supplier)} · ${esc(dday(c.invoice_date))}</h2><p class="q">Invoice ${esc(c.invoice_number || "")}. Prices are already changed in Square. This list updates as jobs are done.</p>
+   ${msg ? `<div class="note ${msg.ok ? "ok" : "err"}">${esc(msg.text)}</div>` : ""}
+   ${tags.length ? `<div class="card"><h3 style="margin-top:0">Change these shelf tags</h3><table><thead><tr><th>Product</th><th>Was</th><th>Now</th><th></th></tr></thead><tbody>
+     ${tags.map(t => `<tr><td>${esc(t.info.name)}</td><td class="muted">${money(t.info.old)}</td><td><b>${money(t.info.new)}</b> ${esc(t.info.per || "")}</td>
+       <td style="text-align:right">${t.status === "open" ? `<button class="primary small" onclick="tickTag(${t.id})">Done</button>` : `<span class="muted">✓ ${esc(t.done_by || "")} ${esc(when(t.done_at))}</span>`}</td></tr>`).join("")}
+     </tbody></table></div>` : ""}
+   ${counts.length ? `<div class="card"><h3 style="margin-top:0">Count these boxes</h3><p class="muted" style="margin-top:-6px">The invoice doesn't say how many are in these. Count one box and pick what it is.</p>${counts.map(countRow).join("")}</div>` : ""}
+   ${holds.length ? `<div class="card"><h3 style="margin-top:0">Leave these tags as they are</h3>${holds.map(holdRow).join("")}</div>` : ""}
+   <div class="row"><button class="primary" onclick="homeScreen()">Done for now</button><button class="secondary" onclick="refreshDelivery()">Refresh</button></div>`);
+}
+function countRow(t) {
+  const i = t.info || {}, a = t.answer || {};
+  const head = `<b>${esc(i.description)}</b><div class="muted">Invoice: ${esc(i.qty ?? "")} × ${esc(i.unit || "")} at ${money(i.unit_price)}</div>`;
+  if (t.status === "done") return `<div style="padding:10px 0;border-bottom:1px solid var(--line)">${head}<div class="note ok">${esc(a.name || "Matched")}: ${esc(a.count)} per box. Counted by ${esc(t.done_by)}.</div></div>`;
+  if (t.status === "escalated") return `<div style="padding:10px 0;border-bottom:1px solid var(--line)">${head}<div class="note">New product: ${esc(a.count)} per box, counted by ${esc(t.done_by)}. Josh will set it up. Don't put out a tag yet.</div></div>`;
+  if (t.status === "closed") return `<div style="padding:10px 0;border-bottom:1px solid var(--line)">${head}<div class="note ok">Sorted already — nothing to do.</div></div>`;
+  const kg = String(i.description || "").match(/(\d+(?:\.\d+)?)\s*KG/i);
+  const opts = (t.candidates || []).map(o => `<label style="display:block;padding:6px 0"><input type="radio" name="c${t.id}" value="${o.stock_item_id}" data-unit="${esc(o.count_unit)}" data-last="${o.last_count ?? ""}" style="width:auto" onchange="countUnit(${t.id})"> ${esc(o.name)}</label>`).join("");
+  return `<div style="padding:10px 0;border-bottom:1px solid var(--line)" id="cr${t.id}">${head}
+    <p style="margin:10px 0 4px">What is it?</p>${opts}
+    <div id="cs${t.id}"></div>
+    <label style="display:block;padding:6px 0"><input type="radio" name="c${t.id}" value="" data-unit="" style="width:auto" onchange="countUnit(${t.id})"> None of these — it's a new product</label>
+    <div class="row" style="margin-top:4px"><input id="q${t.id}" placeholder="Not listed? Search our products" style="max-width:300px"><button class="secondary small" onclick="searchItems(${t.id})">Search</button></div>
+    <p style="margin:12px 0 4px">How many came in <b>one</b> box? <span id="u${t.id}" class="muted"></span>${kg ? ` <span class="muted">(invoice says ${esc(kg[1])} kg)</span>` : ""}</p>
+    <div class="row" style="margin-top:0"><input id="n${t.id}" inputmode="decimal" style="max-width:140px"><button class="primary" onclick="saveCount(${t.id})">Save count</button></div><div id="cm${t.id}"></div></div>`;
+}
+function countUnit(id) {
+  const r = document.querySelector(`input[name="c${id}"]:checked`), u = document.getElementById("u" + id);
+  if (u) u.textContent = r && r.dataset.unit ? "(" + unitWord(r.dataset.unit, 2) + ")" : "";
+}
+async function searchItems(id) {
+  const q = document.getElementById("q" + id).value, box = document.getElementById("cs" + id);
+  box.innerHTML = `<span class="muted">Searching…</span>`;
+  const r = await api(`/tasks/${id}/search?q=` + encodeURIComponent(q));
+  const rows = (r.ok && r.body) || [];
+  box.innerHTML = rows.length ? rows.map(o => `<label style="display:block;padding:6px 0"><input type="radio" name="c${id}" value="${o.stock_item_id}" data-unit="${esc(o.count_unit)}" data-last="${o.last_count ?? ""}" style="width:auto" onchange="countUnit(${id})"> ${esc(o.name)}</label>`).join("")
+    : `<span class="muted">Nothing found that can be used for this supplier. If it's new, choose "None of these".</span>`;
+}
+function saveCount(id) {
+  const m = document.getElementById("cm" + id), r = document.querySelector(`input[name="c${id}"]:checked`);
+  const n = Number(document.getElementById("n" + id).value);
+  if (!r) { m.innerHTML = `<div class="note err">Pick what it is, or "None of these".</div>`; return; }
+  if (!(n > 0)) { m.innerHTML = `<div class="note err">Enter how many came in one box.</div>`; return; }
+  const last = Number(r.dataset.last);
+  if (last > 0 && Math.abs(n - last) / last > 0.5 && !m.dataset.confirmed) {
+    m.dataset.confirmed = "1";
+    m.innerHTML = `<div class="note">The last box of this had ${last}. Please recount, then tap Save count again to confirm ${n}.</div>`;
+    return;
+  }
+  const item = r.value ? Number(r.value) : null;
+  pickName(async () => {
+    const res = await api(`/tasks/${id}/count`, { method: "POST", body: JSON.stringify({ stock_item_id: item, count: n, by: WHO }) });
+    await afterAction(res, item ? "Saved. Stock booked and price checked." : "Saved. Josh will set up the new product.");
+  });
+}
+function holdRow(t) {
+  const i = t.info || {}, a = t.answer || {};
+  const line = t.kind === "noprice"
+    ? `<b>${esc(i.name)}</b> — no shelf price yet. Don't put out a tag until Josh sets one.`
+    : `<b>${esc(i.name)}</b> — keep at ${money(i.old)} ${esc(i.per || "")}.`;
+  const state = t.status === "kept" ? `<div class="muted">Josh kept the current price.</div>`
+    : t.status === "approved" ? `<div class="muted">Josh set ${money(a.price)} — it's in the tag list now.</div>`
+    : DLV.owner ? ownerButtons(t) : `<div class="muted">Josh is deciding.</div>`;
+  return `<div style="padding:10px 0;border-bottom:1px solid var(--line)">${line}${state}</div>`;
+}
+function ownerButtons(t) {
+  const i = t.info || {};
+  const quick = t.kind === "hold" ? `<button class="primary small" onclick="decide(${t.id},'approve',${Number(i.new)})">Change to ${money(i.new)}</button>
+      <button class="secondary small" onclick="decide(${t.id},'keep')">Keep ${money(i.old)}</button>` : "";
+  return `<div class="muted">${t.kind === "hold" ? `Worked-out price ${money(i.new)} (${Math.round(Math.abs(Number(i.pct) || 0))}% change)${i.failed ? " — Square didn't take it last time" : ""}` : "Set a shelf price"}</div>
+    <div class="row" style="margin-top:6px">${quick}<input id="p${t.id}" inputmode="decimal" placeholder="Other price" style="max-width:140px"><button class="secondary small" onclick="decide(${t.id},'approve',document.getElementById('p${t.id}').value)">Set</button></div>`;
+}
+async function decide(id, decision, price) {
+  const res = await api(`/owner/tasks/${id}/decide`, { method: "POST", body: JSON.stringify({ decision, price: price === undefined ? null : price }) });
+  await afterAction(res, decision === "keep" ? "Kept the current price." : "Price changed in Square. Staff will see a tag to change.");
+}
+function tickTag(id) {
+  pickName(async () => { const res = await api(`/tasks/${id}/tick`, { method: "POST", body: JSON.stringify({ by: WHO }) }); await afterAction(res, null); });
+}
+async function afterAction(res, okText) {
+  const sid = S.delivery, view = S.view;
+  await fetchDeliveries();
+  const msg = res.ok ? (okText ? { ok: true, text: okText } : null) : { ok: false, text: (res.body && res.body.error) || "Couldn't save. Try again." };
+  view === "josh" ? joshScreen(msg) : deliveryScreen(sid, msg);
+}
+async function refreshDelivery() { await fetchDeliveries(); deliveryScreen(S.delivery); }
+async function joshScreen(msg) {
+  S.view = "josh";
+  if (!msg) await fetchDeliveries();
+  const rows = DLV.cards.flatMap(c => jobs(c, ["hold", "noprice"]).filter(t => t.status === "open").map(t => ({ c, t })));
+  const news = DLV.cards.flatMap(c => jobs(c, ["count"]).filter(t => t.status === "escalated").map(t => ({ c, t })));
+  $(`<h2>Price decisions</h2>${msg ? `<div class="note ${msg.ok ? "ok" : "err"}">${esc(msg.text)}</div>` : ""}
+   ${rows.length ? rows.map(({ c, t }) => `<div class="card"><div class="muted">${esc(c.supplier)} · ${esc(dday(c.invoice_date))}</div>${holdRow(t)}</div>`).join("") : `<p>No price decisions waiting.</p>`}
+   ${news.length ? `<h3>New products counted by staff</h3><p class="muted">Set these up in a chat with Claude — the staff count is recorded.</p>${news.map(({ c, t }) => `<div class="card"><div class="muted">${esc(c.supplier)} · ${esc(dday(c.invoice_date))}</div>${countRow(t)}</div>`).join("")}` : ""}
+   <div class="row"><button class="secondary" onclick="S.view=null;homeScreen()">Back</button></div>`);
 }
 
 // ---------- supplier
