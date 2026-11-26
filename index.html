@@ -316,8 +316,7 @@ function deliveryScreen(sid, msg) {
    ${c.practice ? `<div class="note">PRACTICE DELIVERY — try anything here. Nothing changes in Square, stock or costs. Josh will remove it when you're done.</div>` : ""}
    ${msg ? `<div class="note ${msg.ok ? "ok" : "err"}">${esc(msg.text)}</div>` : ""}
    ${tags.length ? `<div class="card"><h3 style="margin-top:0">Change these shelf tags</h3><table><thead><tr><th>Product</th><th>Was</th><th>Now</th><th></th></tr></thead><tbody>
-     ${tags.map(t => `<tr><td>${esc(t.info.name)}</td><td class="muted">${money(t.info.old)}</td><td><b>${money(t.info.new)}</b> ${esc(t.info.per || "")}</td>
-       <td style="text-align:right">${tagCell(t)}</td></tr>`).join("")}
+     ${tags.map(tagRows).join("")}
      </tbody></table></div>` : ""}
    ${counts.length ? `<div class="card"><h3 style="margin-top:0">Count these boxes</h3><p class="muted" style="margin-top:-6px">The invoice doesn't say how many are in these. Count one box and pick what it is.</p>${counts.map(countRow).join("")}</div>` : ""}
    ${holds.length ? `<div class="card"><h3 style="margin-top:0">Leave these tags as they are</h3>${holds.map(holdRow).join("")}</div>` : ""}
@@ -401,18 +400,42 @@ async function decide(id, decision, price) {
   const isBox = DLV.cards.some(c => (c.tasks || []).some(t => t.id === id && t.kind === "boxsize"));
   await afterAction(res, decision === "keep" ? "Kept as it was." : isBox ? "New usual box size saved for future deliveries." : (res.body && res.body.register === "on tag confirm" ? "Price approved. Staff will see a tag to change; the register updates when they confirm it." : "Price changed in Square. Staff will see a tag to change."));
 }
+// One shelf-tag job: the main tag row, then one row per half/quarter tag in the same group (names and prices only).
+const PART_STATE = { applied: "✓ register updated", skipped: "left as is", blocked: "Josh to check", conflict: "Josh to check",
+  failed: "not updated yet", ambiguous: "not updated yet", applying: "updating…", superseded: "replaced" };
+function tagRows(t) {
+  const parts = Array.isArray(t.parts) ? t.parts : [];
+  const main = `<tr><td>${esc(t.info.name)}${parts.length ? ` <span class="muted">(+${parts.length} smaller tag${parts.length === 1 ? "" : "s"})</span>` : ""}</td>
+    <td class="muted">${money(t.info.old)}</td><td><b>${money(t.info.new)}</b> ${esc(t.info.per || "")}</td>
+    <td style="text-align:right"${parts.length ? ` rowspan="${parts.length + 1}"` : ""}>${tagCell(t)}</td></tr>`;
+  return main + parts.map(p => `<tr class="part"><td style="padding-left:22px">↳ ${esc(p.name || "Smaller tag")}</td>
+    <td class="muted">${p.old == null ? "?" : money(p.old)}</td><td><b>${money(p.new)}</b> ${esc(p.per || "")}
+    ${t.status === "open" && PART_STATE[p.state] && p.state !== "ready" ? `<div class="muted">${esc(PART_STATE[p.state])}</div>` : ""}</td></tr>`).join("");
+}
 // Shelf-tag job cell. apply_on_confirm jobs update the register only when staff confirm the tag is changed;
 // tag_only (older) jobs are just ticked off. The server owns claim/idempotency; the page only blocks double taps.
 function tagCell(t) {
   const who = `${esc(t.done_by || "")} ${esc(when(t.done_at))}`;
-  if (t.price_mode !== "apply_on_confirm")
+  if (t.price_mode !== "apply_on_confirm") {
+    if (t.status === "superseded") return `<span class="muted">Replaced by a newer price — use the newer tag</span>`;
     return t.status === "open" ? `<button class="primary small" onclick="tickTag(${t.id})">Done</button>` : `<span class="muted">✓ ${who}</span>`;
+  }
   if (t.status === "superseded" || t.apply_state === "superseded") return `<span class="muted">Replaced by a newer price — use the newer tag</span>`;
   if (t.apply_state === "applied") return `<span class="muted">✓ Register updated · ${who}</span>`;
   if (t.apply_state === "conflict") return `<span class="note err" style="display:inline-block;margin:0">Josh needs to check: the register price was changed elsewhere.</span>`;
+  if (t.status === "kept" || t.apply_state === "kept") return `<span class="muted">Josh kept the register price — leave this tag</span>`;
+  const parts = Array.isArray(t.parts) ? t.parts : [];
+  if (t.apply_state === "partial") {
+    const retryable = parts.some(p => ["failed", "ambiguous", "ready"].includes(p.state));
+    return `<div class="muted">Main price is in the register.</div>` + (retryable
+      ? `<button class="primary small" id="tag${t.id}" onclick="tickTag(${t.id})">Try again — smaller tags</button>`
+      : `<span class="note err" style="display:inline-block;margin:0">Josh needs to check a smaller tag's price.</span>`);
+  }
   if (t.apply_state === "applying") return `<span class="muted">Updating the register…</span> <button class="secondary small" onclick="refreshDelivery()">Check</button>`;
   const retry = t.apply_state === "failed";
-  return `${retry ? `<div class="muted" style="color:var(--bad)">Last try didn't finish.</div>` : ""}<button class="primary small" id="tag${t.id}" onclick="tickTag(${t.id})">${retry ? "Try again — update register" : "Tag changed — update register"}</button>`;
+  const n = 1 + parts.filter(p => !["skipped", "superseded"].includes(p.state)).length;
+  const label = retry ? "Try again — update register" : n > 1 ? `All ${n} tags changed — update register` : "Tag changed — update register";
+  return `${retry ? `<div class="muted" style="color:var(--bad)">Last try didn't finish.</div>` : ""}${n > 1 && !retry ? `<div class="muted">Change the main tag and the smaller tags first.</div>` : ""}<button class="primary small" id="tag${t.id}" onclick="tickTag(${t.id})">${label}</button>`;
 }
 let TAG_BUSY = {};
 function tickTag(id) {
@@ -424,6 +447,7 @@ function tickTag(id) {
     try {
       const res = await api(`/tasks/${id}/tick`, { method: "POST", body: JSON.stringify({ by: WHO }) });
       await afterAction(res, res.ok && res.body && res.body.register === "updated" ? "Register updated." : null);
+      // (a partial result arrives as an error with its own wording; the row then shows what is left)
     } catch (e) { /* 401: setup screen already shown */ }
     finally { delete TAG_BUSY[id]; }
   });

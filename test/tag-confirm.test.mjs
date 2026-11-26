@@ -58,3 +58,30 @@ test('a second tap while the first is in flight does not send a second request',
   await settle(10);
   assert.equal(reqs.filter(r => /\/tasks\/7\/tick$/.test(r.path)).length, 1);
 });
+
+const parts = [{ name: 'Pumpkin – Half', per: 'per kg', old: 2.5, new: 2.7, state: 'ready' }, { name: 'Pumpkin – Quarter', per: 'per kg', old: null, new: 1.4, state: 'blocked' }];
+test('grouped job shows each smaller tag by name with old -> new, and asks to confirm the whole group', async () => {
+  const { ctx, el } = app([tag({ price_mode: 'apply_on_confirm', apply_state: 'ready', parts })]);
+  await settle(); await vm.runInContext('fetchDeliveries()', ctx); vm.runInContext('deliveryScreen("inv-1")', ctx);
+  const h = el('app').innerHTML;
+  assert.match(h, /Pumpkin – Half/); assert.match(h, /\$2\.50/); assert.match(h, /\$2\.70/);
+  assert.match(h, /Pumpkin – Quarter/); assert.match(h, /Josh to check/);
+  assert.match(h, /All 3 tags changed — update register/); assert.match(h, /Change the main tag and the smaller tags first/);
+  assert.doesNotMatch(h, /VAR[A-Z0-9]{10,}/);
+});
+test('partial job: retry only when a smaller tag can be retried; otherwise Josh', async () => {
+  for (const [state, re] of [['failed', /Try again — smaller tags/], ['conflict', /Josh needs to check a smaller tag/]]) {
+    const { ctx, el } = app([tag({ price_mode: 'apply_on_confirm', apply_state: 'partial', parts: [{ ...parts[0], state }] })]);
+    await settle(); await vm.runInContext('fetchDeliveries()', ctx); vm.runInContext('deliveryScreen("inv-1")', ctx);
+    assert.match(el('app').innerHTML, re, state);
+    assert.match(el('app').innerHTML, /Main price is in the register/);
+  }
+});
+test('superseded tag-only reminder no longer asks staff to change the label; kept job says leave it', async () => {
+  for (const [t, re] of [[tag({ status: 'superseded', price_mode: 'tag_only' }), /Replaced by a newer price/],
+                         [tag({ status: 'kept', price_mode: 'apply_on_confirm', apply_state: 'kept' }), /Josh kept the register price/]]) {
+    const { ctx, el } = app([t]);
+    await settle(); await vm.runInContext('fetchDeliveries()', ctx); vm.runInContext('deliveryScreen("inv-1")', ctx);
+    assert.match(el('app').innerHTML, re); assert.doesNotMatch(el('app').innerHTML, /onclick="tickTag/);
+  }
+});
