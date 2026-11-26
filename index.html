@@ -59,6 +59,10 @@ const DEPTS = ["Garden","Gift Store","Grocer"];
 })();
 let KEY = null, OWNER = null; try { KEY = localStorage.getItem("pd_key"); OWNER = localStorage.getItem("pd_owner"); } catch(e) {}
 let S = { dept: "Garden", supplier: null, photos: [], receipt: null };
+// Unsent photo set kept across Home, Recent deliveries and the idle timer. op is a durable upload id: the server
+// uses it as the receipt id, so sending the same set again can never create a second delivery.
+let DRAFT = null;
+const newOp = () => (typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : "xxxxxxxx-xxxx-4xxx-8xxx-xxxxxxxxxxxx".replace(/x/g, () => (Math.random() * 16 | 0).toString(16)));
 let VIEW = 0; // bumped on every screen render; async work started on an older screen must not write into a newer one
 const $ = (h) => { VIEW++; RETRY = null; clearBusy(); document.getElementById("app").innerHTML = h; window.scrollTo(0,0); };
 // JS string literal for use inside a double-quoted onclick="..." (JSON for JS, then HTML-escaped for the attribute)
@@ -95,8 +99,10 @@ function noKey(){ $(`<h2>This iPad isn't set up yet</h2><p>Ask Josh to open the 
 let idleT; function idle(){ clearTimeout(idleT); idleT = setTimeout(() => { if (!S.receipt) homeScreen(); }, 15*60*1000); }
 async function homeScreen() {
   if (!KEY && !OWNER) return noKey();
+  if (S.photos.length && !S.receipt) DRAFT = { dept: S.dept, supplier: S.supplier, photos: S.photos, op: S.op, uncertain: !!S.uncertain };
   S = { dept: S.dept, supplier: null, photos: [], receipt: null }; WHO = null;
-  $(`<div id="own"><div id="own-josh"></div><div id="own-needs"></div></div><div class="row" style="margin:0 0 18px"><button class="big" style="width:auto;padding:14px 22px" onclick="pricesScreen()">Shelf prices</button></div><div id="dlv"></div><h2>New delivery</h2><p class="q">Which department is it for?</p>
+  $(`${DRAFT ? `<div class="note" style="margin:0 0 14px"><b>Unsent photos</b> for ${esc(DRAFT.supplier)} (${DRAFT.photos.length} photo${DRAFT.photos.length === 1 ? "" : "s"})${DRAFT.uncertain ? " — the last send may have arrived; check Recent deliveries below. Sending again won't create a second copy." : "."}
+  <div class="row" style="margin-top:8px"><button class="primary small" onclick="resumeDraft()">Resume</button><button class="secondary small" onclick="discardDraft()">Discard</button></div></div>` : ""}<div id="own"><div id="own-josh"></div><div id="own-needs"></div></div><div class="row" style="margin:0 0 18px"><button class="big" style="width:auto;padding:14px 22px" onclick="pricesScreen()">Shelf prices</button></div><div id="dlv"></div><h2>New delivery</h2><p class="q">Which department is it for?</p>
   <div class="grid">${DEPTS.map(d=>`<button class="big" onclick="S.dept='${d}';supplierScreen()">${d}</button>`).join("")}</div>
   <h2 style="margin-top:28px">Recent deliveries</h2><p class="muted" style="margin:-8px 0 6px">All retail deliveries from the last 14 days. Tap a <span class="tag">photo</span> one to see its new products and print labels.</p>
   <div class="row" style="margin:0 0 6px">${["All", ...DEPTS].map(d => `<button id="rd-${d.replace(" ","")}" class="secondary small" onclick="RD.dept='${d}';drawRecent()">${d}</button>`).join("")}</div>
@@ -451,8 +457,16 @@ function photoScreen() {
   <div class="row"><button class="primary" id="send" disabled onclick="sendPhotos()">Send to be read</button><button class="secondary" onclick="supplierScreen()">Back</button></div>`);
   drawThumbs();
 }
-function drawThumbs(){ document.getElementById("th").innerHTML = S.photos.map((p,i)=>`<div><img src="${p}"><br><button class="secondary small" onclick="S.photos.splice(${i},1);drawThumbs()">Remove</button></div>`).join(""); document.getElementById("send").disabled = !S.photos.length; }
-async function addPhotos(files) { for (const f of files) { if (S.photos.length >= 6) break; S.photos.push(await shrink(f)); } drawThumbs(); }
+function drawThumbs(){ document.getElementById("th").innerHTML = S.photos.map((p,i)=>`<div><img src="${p}"><br><button class="secondary small" onclick="S.photos.splice(${i},1);if(S.uncertain){S.op=newOp();S.uncertain=false;}drawThumbs()">Remove</button></div>`).join(""); document.getElementById("send").disabled = !S.photos.length; }
+async function addPhotos(files) {
+  if (!S.op) S.op = newOp();
+  // changing the photo set after an uncertain send means it is a different upload
+  if (S.uncertain) { S.op = newOp(); S.uncertain = false; }
+  for (const f of files) { if (S.photos.length >= 6) break; S.photos.push(await shrink(f)); }
+  drawThumbs();
+}
+function resumeDraft() { if (!DRAFT) return homeScreen(); S = { dept: DRAFT.dept, supplier: DRAFT.supplier, photos: DRAFT.photos, op: DRAFT.op, uncertain: DRAFT.uncertain, receipt: null }; DRAFT = null; photoScreen(); }
+function discardDraft() { DRAFT = null; homeScreen(); }
 function shrink(file) {
   return new Promise((res, rej) => {
     const img = new Image(); img.onload = () => {
@@ -469,19 +483,21 @@ async function sendPhotos() {
   btn.disabled = true;
   document.getElementById("pmsg").innerHTML = `<div class="spinner"></div>`;
   let r;
-  try { r = await api("/receipts", { method: "POST", body: JSON.stringify({ supplier: S.supplier, department: S.dept, images: S.photos.map(p => p.split(",")[1]) }) }); }
+  if (!S.op) S.op = newOp();
+  try { r = await api("/receipts", { method: "POST", body: JSON.stringify({ op_id: S.op, supplier: S.supplier, department: S.dept, images: S.photos.map(p => p.split(",")[1]) }) }); }
   catch (e) { return; } // 401: the setup screen has already been shown
   if (v !== VIEW || !document.getElementById("pmsg")) return;
   if (!r.ok || !(r.body && r.body.id)) {
     // Not replayed automatically. 503 is rejected before anything is saved; a lost connection or server error may or may not have saved it.
     const sure = r.status === 503 || r.status === 400;
+    S.uncertain = !sure;
     const msg = sure ? `${r.body.error || "Couldn't send."} Nothing was saved — your photos are still here. Tap Send to try again.`
-      : `${r.body.reason || r.body.error || "Couldn't send."} It may or may not have been saved. Check Recent deliveries on the home screen before sending again — your photos are still here.`;
+      : `${r.body.reason || r.body.error || "Couldn't send."} It may or may not have arrived. Your photos are kept (also if you go Home). Tap Send again: if it already arrived it won't be sent twice.`;
     document.getElementById("pmsg").innerHTML = `<div class="note err">${esc(msg)}</div>`;
     const b2 = document.getElementById("send"); if (b2) b2.disabled = !S.photos.length;
     return;
   }
-  S.receipt = r.body.id; readingScreen();
+  S.receipt = r.body.id; S.uncertain = false; DRAFT = null; readingScreen();
 }
 
 // ---------- reading

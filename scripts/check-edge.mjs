@@ -14,7 +14,7 @@ const dir = new URL('../supabase/functions/delivery-app/', import.meta.url);
 const FILES = ['index.ts', 'auth.ts'];
 const REQUIRED = {
   'index.ts': ['Deno.serve(', 'from "./auth.ts"', 'export const BUILD = "', 'export const SOURCE_SHA = {', '"/health"', '"/deliveries"',
-               '"/recent-deliveries"', '"/prices/all"', '"/recent"', '"/suppliers"', '"/receipts"', 'ConfigUnavailable', 'whoFromHeaders'],
+               '"/recent-deliveries"', '"/prices/all"', '"/recent"', '"/suppliers"', '"/receipts"', 'op_id', 'ConfigUnavailable', 'whoFromHeaders'],
   'auth.ts': ['export class ConfigUnavailable', 'export function makeCfg', 'export async function whoFromHeaders'],
 };
 const MIN_BYTES = { 'index.ts': 15000, 'auth.ts': 1500 };

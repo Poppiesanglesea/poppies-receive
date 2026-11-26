@@ -15,13 +15,15 @@
 // v15 (26 Nov 2026): config-read failures fail closed as 503 (never cached, never reported as an invalid device);
 //   wrong/malformed keys stay 401 (auth.ts, tested in repo). Routes now surface DB errors instead of returning empty
 //   success. GET /health reports BUILD and SOURCE_SHA (embedded by scripts/check-edge.mjs) for deploy verification.
+// v16 (26 Nov 2026): POST /receipts accepts a client op_id (uuid) and uses it as the receipt id, so re-sending the same
+//   photo set after an uncertain failure returns the existing receipt instead of creating a duplicate delivery.
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import { PDFDocument } from "npm:pdf-lib@1.17.1";
 import { ConfigUnavailable, makeCfg, whoFromHeaders } from "./auth.ts";
 
-export const BUILD = "delivery-app v15 2026-11-26";
+export const BUILD = "delivery-app v16 2026-11-26";
 // SOURCE_SHA is written by scripts/check-edge.mjs --write: sha-256 of index.ts (with this one line removed) and auth.ts.
-export const SOURCE_SHA = { index: "6f1f7b17c6d3169ee5f379554bcafd6427c0b752ddd013dcdf94929886cbcdac", auth: "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331" };
+export const SOURCE_SHA = { index: "f08157cb25c1d77ee0dd474714fccd02c3c1bc7e15d99fc3e30e400a6dc8c9d2", auth: "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331" };
 
 const URL_ = Deno.env.get("SUPABASE_URL")!;
 const SB = createClient(URL_, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
@@ -225,14 +227,23 @@ Deno.serve(async (req) => {
       const department = String(b.department ?? "");
       const images: string[] = Array.isArray(b.images) ? b.images : [];
       if (!supplier || !DEPTS.includes(department) || !images.length || images.length > 6) return json({ error: "supplier, department and 1 to 6 photos are needed" }, 400);
-      const id = crypto.randomUUID();
+      const opId = typeof b.op_id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(b.op_id) ? b.op_id : null;
+      if (opId) {
+        const { data: prior, error: priorErr } = await SB.from("delivery_receipts").select("id, status, supplier, department").eq("id", opId).maybeSingle();
+        if (priorErr) return json({ error: "Couldn't check for an earlier send. Try again." }, 500);
+        if (prior) {
+          if (prior.supplier !== supplier || prior.department !== department) return json({ error: "This upload id belongs to a different delivery." }, 409);
+          return json({ id: prior.id, status: prior.status, already_received: true }, 200);
+        }
+      }
+      const id = opId ?? crypto.randomUUID();
       const source_id = `app:${id}`;
       const pdf = await PDFDocument.create();
       const paths: string[] = [];
       for (let i = 0; i < images.length; i++) {
         const bytes = b64ToBytes(images[i]);
         const p = `${new Date().toISOString().slice(0, 10)}/${id}/page-${i + 1}.jpg`;
-        const up = await SB.storage.from("delivery-photos").upload(p, bytes, { contentType: "image/jpeg" });
+        const up = await SB.storage.from("delivery-photos").upload(p, bytes, { contentType: "image/jpeg", upsert: true });
         if (up.error) throw new Error(`photo upload: ${up.error.message}`);
         paths.push(p);
         const img = await pdf.embedJpg(bytes);
@@ -240,8 +251,14 @@ Deno.serve(async (req) => {
         page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
       }
       const pdfBytes = await pdf.save();
-      await SB.storage.from("delivery-photos").upload(`${paths[0].split("/").slice(0, 2).join("/")}/invoice.pdf`, pdfBytes, { contentType: "application/pdf" });
-      await SB.from("delivery_receipts").insert({ id, source_id, supplier, department, photo_paths: paths, status: "reading" });
+      await SB.storage.from("delivery-photos").upload(`${paths[0].split("/").slice(0, 2).join("/")}/invoice.pdf`, pdfBytes, { contentType: "application/pdf", upsert: true });
+      const ins = await SB.from("delivery_receipts").insert({ id, source_id, supplier, department, photo_paths: paths, status: "reading" });
+      if (ins.error) {
+        // a concurrent send with the same op_id won the insert: return that receipt rather than a duplicate
+        const { data: won } = await SB.from("delivery_receipts").select("id, status").eq("id", id).maybeSingle();
+        if (won) return json({ id: won.id, status: won.status, already_received: true }, 200);
+        return json({ error: "Couldn't save the delivery. Try again." }, 500);
+      }
       const r = await fetch(`${URL_}/functions/v1/invoice-reader`, {
         method: "POST",
         headers: { "content-type": "application/json", "x-poppies-key": HOOK_KEY },

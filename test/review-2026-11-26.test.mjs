@@ -155,7 +155,7 @@ test('sending photos: a dropped connection keeps the photos, re-enables Send, wa
   assert.equal(reqs.filter(r => r === '/receipts').length, 1, 'no automatic replay');
   assert.equal(el('send').disabled, false);
   assert.equal(vm.runInContext('S.photos.length', ctx), 1);
-  assert.match(el('pmsg').innerHTML, /may or may not have been saved/);
+  assert.match(el('pmsg').innerHTML, /may or may not have arrived/);
 });
 
 test('sending photos: a 503 says nothing was saved', async () => {
@@ -167,4 +167,44 @@ test('sending photos: a 503 says nothing was saved', async () => {
   await vm.runInContext('sendPhotos()', ctx);
   assert.match(el('pmsg').innerHTML, /Nothing was saved/);
   assert.equal(el('send').disabled, false);
+});
+
+test('dropped send -> Home (check Recent) -> Resume keeps the photos and re-sends with the SAME upload id', async () => {
+  const bodies = [];
+  let attempt = 0;
+  const { ctx, el } = app({ '/receipts': async () => { attempt++; if (attempt === 1) throw new Error('network down'); return { id: bodies[0].op_id, status: 'reading' }; } });
+  const realFetch = ctx.fetch;
+  ctx.fetch = async (url, o) => { if (url.endsWith('/receipts') && o && o.body) bodies.push(JSON.parse(o.body)); return realFetch(url, o); };
+  await settle();
+  vm.runInContext('S.supplier = "Supplier A"; S.dept = "Grocer"; S.photos = ["data:image/jpeg;base64,AAA","data:image/jpeg;base64,BBB"]; S.op = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";', ctx);
+  vm.runInContext('photoScreen()', ctx); el('send').disabled = false;
+  await vm.runInContext('sendPhotos()', ctx);
+  vm.runInContext('homeScreen()', ctx); await settle(6);
+  assert.match(el('app').innerHTML, /Unsent photos/);
+  assert.match(el('app').innerHTML, /may have arrived/);
+  assert.equal(vm.runInContext('DRAFT.photos.length', ctx), 2);
+  vm.runInContext('resumeDraft()', ctx);
+  assert.equal(vm.runInContext('S.photos.length', ctx), 2);
+  el('send').disabled = false;
+  vm.runInContext('readingScreen = () => {}', ctx);
+  await vm.runInContext('sendPhotos()', ctx);
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[0].op_id, 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee');
+  assert.equal(bodies[1].op_id, bodies[0].op_id, 'resend reuses the durable upload id');
+  assert.equal(vm.runInContext('DRAFT', ctx), null);
+});
+
+test('changing the photos after an uncertain send starts a new upload id; discard clears the draft', async () => {
+  const { ctx } = app({ '/receipts': async () => { throw new Error('network down'); } });
+  await settle();
+  vm.runInContext('S.supplier = "Supplier A"; S.dept = "Grocer"; S.photos = ["data:image/jpeg;base64,AAA","data:image/jpeg;base64,BBB"]; S.op = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";', ctx);
+  vm.runInContext('photoScreen()', ctx);
+  vm.runInContext('document.getElementById("send").disabled = false', ctx);
+  await vm.runInContext('sendPhotos()', ctx);
+  vm.runInContext('S.photos.splice(1,1); if(S.uncertain){S.op=newOp();S.uncertain=false;}', ctx);
+  assert.notEqual(vm.runInContext('S.op', ctx), 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee');
+  vm.runInContext('homeScreen()', ctx); await settle(4);
+  assert.notEqual(vm.runInContext('DRAFT', ctx), null);
+  vm.runInContext('discardDraft()', ctx); await settle(4);
+  assert.equal(vm.runInContext('DRAFT', ctx), null);
 });
