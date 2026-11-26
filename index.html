@@ -312,12 +312,12 @@ function deliveryScreen(sid, msg) {
   if (!c) return homeScreen();
   S.delivery = sid; S.view = "delivery";
   const tags = jobs(c, ["tag"]), counts = jobs(c, ["count"]), holds = jobs(c, ["hold", "noprice"]);
-  $(`<h2>${esc(c.supplier)} · ${esc(dday(c.invoice_date))}</h2><p class="q">${c.practice ? "Practice run." : `Invoice ${esc(c.invoice_number || "")}. Prices are already changed in Square.`} This list updates as jobs are done.</p>
+  $(`<h2>${esc(c.supplier)} · ${esc(dday(c.invoice_date))}</h2><p class="q">${c.practice ? "Practice run." : `Invoice ${esc(c.invoice_number || "")}. ${tags.some(t => t.price_mode === "apply_on_confirm") ? "Change each tag on the shelf, then tap its button: that updates the register price." : "Prices are already changed in Square."}`} This list updates as jobs are done.</p>
    ${c.practice ? `<div class="note">PRACTICE DELIVERY — try anything here. Nothing changes in Square, stock or costs. Josh will remove it when you're done.</div>` : ""}
    ${msg ? `<div class="note ${msg.ok ? "ok" : "err"}">${esc(msg.text)}</div>` : ""}
    ${tags.length ? `<div class="card"><h3 style="margin-top:0">Change these shelf tags</h3><table><thead><tr><th>Product</th><th>Was</th><th>Now</th><th></th></tr></thead><tbody>
      ${tags.map(t => `<tr><td>${esc(t.info.name)}</td><td class="muted">${money(t.info.old)}</td><td><b>${money(t.info.new)}</b> ${esc(t.info.per || "")}</td>
-       <td style="text-align:right">${t.status === "open" ? `<button class="primary small" onclick="tickTag(${t.id})">Done</button>` : `<span class="muted">✓ ${esc(t.done_by || "")} ${esc(when(t.done_at))}</span>`}</td></tr>`).join("")}
+       <td style="text-align:right">${tagCell(t)}</td></tr>`).join("")}
      </tbody></table></div>` : ""}
    ${counts.length ? `<div class="card"><h3 style="margin-top:0">Count these boxes</h3><p class="muted" style="margin-top:-6px">The invoice doesn't say how many are in these. Count one box and pick what it is.</p>${counts.map(countRow).join("")}</div>` : ""}
    ${holds.length ? `<div class="card"><h3 style="margin-top:0">Leave these tags as they are</h3>${holds.map(holdRow).join("")}</div>` : ""}
@@ -399,10 +399,34 @@ function ownerButtons(t) {
 async function decide(id, decision, price) {
   const res = await api(`/owner/tasks/${id}/decide`, { method: "POST", body: JSON.stringify({ decision, price: price === undefined ? null : price }) });
   const isBox = DLV.cards.some(c => (c.tasks || []).some(t => t.id === id && t.kind === "boxsize"));
-  await afterAction(res, decision === "keep" ? "Kept as it was." : isBox ? "New usual box size saved for future deliveries." : "Price changed in Square. Staff will see a tag to change.");
+  await afterAction(res, decision === "keep" ? "Kept as it was." : isBox ? "New usual box size saved for future deliveries." : (res.body && res.body.register === "on tag confirm" ? "Price approved. Staff will see a tag to change; the register updates when they confirm it." : "Price changed in Square. Staff will see a tag to change."));
 }
+// Shelf-tag job cell. apply_on_confirm jobs update the register only when staff confirm the tag is changed;
+// tag_only (older) jobs are just ticked off. The server owns claim/idempotency; the page only blocks double taps.
+function tagCell(t) {
+  const who = `${esc(t.done_by || "")} ${esc(when(t.done_at))}`;
+  if (t.price_mode !== "apply_on_confirm")
+    return t.status === "open" ? `<button class="primary small" onclick="tickTag(${t.id})">Done</button>` : `<span class="muted">✓ ${who}</span>`;
+  if (t.status === "superseded" || t.apply_state === "superseded") return `<span class="muted">Replaced by a newer price — use the newer tag</span>`;
+  if (t.apply_state === "applied") return `<span class="muted">✓ Register updated · ${who}</span>`;
+  if (t.apply_state === "conflict") return `<span class="note err" style="display:inline-block;margin:0">Josh needs to check: the register price was changed elsewhere.</span>`;
+  if (t.apply_state === "applying") return `<span class="muted">Updating the register…</span> <button class="secondary small" onclick="refreshDelivery()">Check</button>`;
+  const retry = t.apply_state === "failed";
+  return `${retry ? `<div class="muted" style="color:var(--bad)">Last try didn't finish.</div>` : ""}<button class="primary small" id="tag${t.id}" onclick="tickTag(${t.id})">${retry ? "Try again — update register" : "Tag changed — update register"}</button>`;
+}
+let TAG_BUSY = {};
 function tickTag(id) {
-  pickName(async () => { const res = await api(`/tasks/${id}/tick`, { method: "POST", body: JSON.stringify({ by: WHO }) }); await afterAction(res, null); });
+  if (TAG_BUSY[id]) return;
+  pickName(async () => {
+    if (TAG_BUSY[id]) return;
+    TAG_BUSY[id] = true;
+    const b = document.getElementById("tag" + id); if (b) { b.disabled = true; b.textContent = "Updating…"; }
+    try {
+      const res = await api(`/tasks/${id}/tick`, { method: "POST", body: JSON.stringify({ by: WHO }) });
+      await afterAction(res, res.ok && res.body && res.body.register === "updated" ? "Register updated." : null);
+    } catch (e) { /* 401: setup screen already shown */ }
+    finally { delete TAG_BUSY[id]; }
+  });
 }
 async function afterAction(res, okText) {
   const sid = S.delivery, view = S.view;

@@ -19,6 +19,14 @@
 --    new price the job becomes 'conflict' for Josh. The write uses the version just read (Square rejects a stale
 --    version) and an idempotency key per job+price, then Square is read back and must show the new price before the
 --    job is completed. Any failure leaves state 'failed' with the reason; Try again is safe.
+--  * Square idempotency: each apply job holds a durable op_key, reused across retries while the last write outcome is
+--    ambiguous (no/5xx response, timeout) and replaced only after a definite failure (version conflict or 4xx). The
+--    key is never derived from variation+price, so a price returning to an earlier value is a new operation.
+--    (The legacy square_set_variation_price keeps its variation+cents key but has no remaining automatic caller.)
+--  * Halves/quarters: their prices are FROZEN on the proposal when it is created (parts list shown on the same grouped
+--    tag job). On confirm each part is checked against its own frozen old price: unchanged -> written with its own
+--    op key and read back; already at new -> done; anything else -> that part is a conflict for Josh. Parts are
+--    never recalculated from the latest cost at confirm time.
 --  * Audit: price_apply_audit records each attempt (job, proposal, invoice source, item, variation, expected old,
 --    new, Square before/after, outcome, staff, time).
 --  * Test isolation: Square I/O goes through price_square_get/price_square_put. If the session has a temp table
@@ -26,10 +34,10 @@
 --
 -- EXACT INTENDED MUTATIONS
 --   function_backup: +6 rows (label 'pre-tag-confirm-2026-11-26').
---   retail_price_proposal: status check gains 'authorised'; ADD columns source, authorised_by, authorised_at;
+--   retail_price_proposal: status check gains 'authorised'; ADD columns source, authorised_by, authorised_at, parts;
 --     partial unique index one 'authorised' per item. No existing rows change.
 --   delivery_tasks: status check gains 'superseded'; ADD columns price_mode, proposal_id, apply_state, claim_token,
---     claimed_at, attempts, apply_result; UPDATE price_mode = 'tag_only' on all existing kind='tag' rows
+--     claimed_at, attempts, apply_result, op_key; UPDATE price_mode = 'tag_only' on all existing kind='tag' rows
 --     (count at apply time; nothing else changes on those rows).
 --   CREATE table price_apply_audit (RLS on, service_role only).
 --   REPLACE functions: produce_price_items, delivery_price_decide, price_rules_scan, price_proposal_apply,
@@ -53,7 +61,8 @@ alter table public.retail_price_proposal add constraint retail_price_proposal_st
 alter table public.retail_price_proposal
   add column if not exists source text,
   add column if not exists authorised_by text,
-  add column if not exists authorised_at timestamptz;
+  add column if not exists authorised_at timestamptz,
+  add column if not exists parts jsonb not null default '[]'::jsonb;
 create unique index if not exists retail_price_proposal_authorised_uniq
   on public.retail_price_proposal (stock_item_id) where status = 'authorised';
 
@@ -67,7 +76,8 @@ alter table public.delivery_tasks
   add column if not exists claim_token uuid,
   add column if not exists claimed_at timestamptz,
   add column if not exists attempts integer not null default 0,
-  add column if not exists apply_result jsonb;
+  add column if not exists apply_result jsonb,
+  add column if not exists op_key uuid;
 update public.delivery_tasks set price_mode = 'tag_only' where kind = 'tag' and price_mode is null;
 
 create table if not exists public.price_apply_audit (
@@ -114,10 +124,10 @@ declare g jsonb; obj jsonb; r jsonb; m record;
 begin
   if to_regclass('pg_temp.square_mock') is not null then
     execute 'select cents, version, fail_put, lose_response from pg_temp.square_mock where variation_id = $1' into m using p_var;
-    if m is null or m.fail_put then return jsonb_build_object('ok', false, 'error', 'mock put failure'); end if;
+    if m is null or m.fail_put then return jsonb_build_object('ok', false, 'ambiguous', false, 'error', 'mock put failure'); end if;
     if m.version <> p_version then return jsonb_build_object('ok', false, 'conflict', true, 'error', 'version changed'); end if;
     execute 'update pg_temp.square_mock set cents = $2, version = version + 1, puts = puts + 1 where variation_id = $1' using p_var, p_cents;
-    if m.lose_response then return jsonb_build_object('ok', false, 'error', 'mock timeout after write'); end if;
+    if m.lose_response then return jsonb_build_object('ok', false, 'ambiguous', true, 'error', 'mock timeout after write'); end if;
     return jsonb_build_object('ok', true, 'mock', true);
   end if;
   g := square_api('GET', '/v2/catalog/object/' || p_var || '?include_related_objects=false', null);
@@ -126,8 +136,10 @@ begin
   if (obj->>'version')::bigint <> p_version then return jsonb_build_object('ok', false, 'conflict', true, 'error', 'version changed'); end if;
   obj := jsonb_set(obj, '{item_variation_data,price_money}', jsonb_build_object('amount', p_cents, 'currency', 'AUD'));
   r := square_api('POST', '/v2/catalog/object', jsonb_build_object('idempotency_key', p_idem, 'object', obj));
-  if (r->>'status')::int = 200 then return jsonb_build_object('ok', true); end if;
-  return jsonb_build_object('ok', false, 'conflict', coalesce(r::text ~* 'VERSION_MISMATCH', false), 'error', 'POST ' || (r->>'status'), 'body', r->'body');
+  if (r->>'status')::int = 200 then return jsonb_build_object('ok', true, 'version', (r->'body'->'catalog_object'->>'version')::bigint); end if;
+  return jsonb_build_object('ok', false, 'conflict', coalesce(r::text ~* 'VERSION_MISMATCH', false),
+                            'ambiguous', coalesce((r->>'status')::int, 0) = 0 or (r->>'status')::int >= 500,
+                            'error', 'POST ' || coalesce(r->>'status', 'no response'), 'body', r->'body');
 end $$;
 
 -- 3) proposal + tag job (no Square write)
@@ -137,7 +149,7 @@ create or replace function public.price_propose_for_tag(
   p_source_id text, p_supplier text, p_invoice_number text, p_invoice_date date, p_department text,
   p_authorised_by text, p_label jsonb)
 returns bigint language plpgsql set search_path to 'public', 'pg_temp' as $$
-declare v_prop bigint; v_task bigint;
+declare v_prop bigint; v_task bigint; v_parts jsonb;
 begin
   perform pg_advisory_xact_lock(hashtext('price-item:' || p_stock_item_id));
   -- supersede the older authorised/pending proposal for this item and close its open jobs
@@ -149,46 +161,54 @@ begin
          done_by = 'system', done_at = now()
     from old where t.status = 'open' and (t.proposal_id = old.id
            or (t.kind = 'hold' and t.stock_item_id = p_stock_item_id));
+  -- freeze half/quarter prices now (from the same cost basis); they are applied with the parent tag, never recalculated
+  select coalesce(jsonb_agg(jsonb_build_object('variation', x->>'variation', 'from', x->'from', 'to', x->'to')), '[]'::jsonb)
+    into v_parts from jsonb_array_elements(coalesce(sync_part_variation_prices(p_stock_item_id, true), '[]'::jsonb)) x;
   insert into retail_price_proposal (stock_item_id, lane, method, old_cost, new_cost, cost_pct, old_price, proposed_price,
-                                     price_pct, cogs_pct_after, below_floor, status, source, authorised_by, authorised_at)
+                                     price_pct, cogs_pct_after, below_floor, status, source, authorised_by, authorised_at, parts)
   values (p_stock_item_id, p_lane, p_method, p_old_cost, p_new_cost, p_cost_pct, p_old, p_new, p_price_pct, p_cogs_after,
-          coalesce(p_below_floor, false), 'authorised', p_source_id, p_authorised_by, now())
+          coalesce(p_below_floor, false), 'authorised', p_source_id, p_authorised_by, now(), v_parts)
   returning id into v_prop;
   insert into delivery_tasks (source_id, supplier, invoice_number, invoice_date, department, kind, stock_item_id,
                               square_variation_id, info, price_mode, proposal_id, apply_state)
   values (p_source_id, p_supplier, p_invoice_number, p_invoice_date, coalesce(p_department, 'Grocer'), 'tag', p_stock_item_id,
-          p_var, coalesce(p_label, '{}'::jsonb) || jsonb_build_object('old', p_old, 'new', p_new), 'apply_on_confirm', v_prop, 'ready')
+          p_var, coalesce(p_label, '{}'::jsonb) || jsonb_build_object('old', p_old, 'new', p_new, 'parts', v_parts), 'apply_on_confirm', v_prop, 'ready')
   on conflict (source_id, kind, coalesce(stock_item_id, 0), coalesce(unmatched_id, 0)) do update
      set info = excluded.info, price_mode = 'apply_on_confirm', proposal_id = excluded.proposal_id, apply_state = 'ready',
-         status = 'open', done_by = null, done_at = null, claim_token = null, claimed_at = null, apply_result = null
+         status = 'open', done_by = null, done_at = null, claim_token = null, claimed_at = null, apply_result = null, op_key = null
    where delivery_tasks.apply_state is distinct from 'applied'
   returning id into v_task;
   return v_task;
 end $$;
 
--- 4) halves/quarters follow the parent at confirm time (same mockable I/O; failures reported, parent not undone)
-create or replace function public.price_parts_apply(p_stock_item_id bigint, p_task_id bigint)
+-- 4) halves/quarters: apply the FROZEN part prices from the proposal (each checked against its own frozen old price)
+create or replace function public.price_parts_apply(p_parts jsonb, p_stock_item_id bigint, p_task_id bigint, p_op uuid)
 returns jsonb language plpgsql set search_path to 'public', 'extensions', 'pg_temp' as $$
-declare r jsonb; g jsonb; w jsonb; v_out jsonb := '[]'::jsonb; v_cents int;
+declare r jsonb; g jsonb; w jsonb; a jsonb; v_out jsonb := '[]'::jsonb; v_to int; v_from int; v_outcome text;
 begin
-  for r in select * from jsonb_array_elements(coalesce(sync_part_variation_prices(p_stock_item_id, true), '[]'::jsonb)) loop
-    v_cents := round((r->>'to')::numeric * 100)::int;
+  for r in select * from jsonb_array_elements(coalesce(p_parts, '[]'::jsonb)) loop
+    v_to := round((r->>'to')::numeric * 100)::int;
+    v_from := case when r->>'from' is null then null else round((r->>'from')::numeric * 100)::int end;
     g := price_square_get(r->>'variation');
     if not coalesce((g->>'ok')::boolean, false) then
-      v_out := v_out || jsonb_build_object('variation', r->>'variation', 'outcome', 'failed', 'error', g->>'error'); continue;
-    end if;
-    if (g->>'cents')::int = v_cents then
-      w := jsonb_build_object('ok', true, 'already', true);
+      v_outcome := 'failed';
+    elsif (g->>'cents')::int = v_to then
+      v_outcome := 'applied_already';
+    elsif v_from is not null and (g->>'cents')::int is distinct from v_from then
+      v_outcome := 'conflict';
     else
-      w := price_square_put(r->>'variation', (g->>'version')::bigint, v_cents, 'poppies-tagpart-' || p_task_id || '-' || (r->>'variation') || '-' || v_cents);
+      w := price_square_put(r->>'variation', (g->>'version')::bigint, v_to, 'poppies-tagpart-' || p_op || '-' || (r->>'variation'));
+      a := price_square_get(r->>'variation');
+      v_outcome := case when coalesce((a->>'ok')::boolean, false) and (a->>'cents')::int = v_to then 'applied'
+                        when coalesce((w->>'conflict')::boolean, false) then 'conflict' else 'failed' end;
     end if;
-    if coalesce((w->>'ok')::boolean, false) then
+    if v_outcome in ('applied', 'applied_already') then
       insert into retail_part_variation_price (square_variation_id, stock_item_id, price, updated_at, last_push)
-      values (r->>'variation', p_stock_item_id, (r->>'to')::numeric, now(), w)
+      values (r->>'variation', p_stock_item_id, (r->>'to')::numeric, now(), jsonb_build_object('task', p_task_id, 'outcome', v_outcome))
       on conflict (square_variation_id) do update set price = excluded.price, updated_at = now(), last_push = excluded.last_push;
     end if;
-    v_out := v_out || jsonb_build_object('variation', r->>'variation', 'to', r->'to',
-                                         'outcome', case when coalesce((w->>'ok')::boolean, false) then 'applied' else 'failed' end);
+    v_out := v_out || jsonb_build_object('variation', r->>'variation', 'from', r->'from', 'to', r->'to', 'outcome', v_outcome,
+                                         'square_cents', g->'cents');
   end loop;
   return v_out;
 end $$;
@@ -219,9 +239,11 @@ begin
   end if;
 
   -- atomic claim (double clicks / overlapping retries); a claim older than 2 minutes may be taken over
-  update delivery_tasks set apply_state = 'applying', claim_token = v_token, claimed_at = now(), attempts = attempts + 1
+  update delivery_tasks set apply_state = 'applying', claim_token = v_token, claimed_at = now(), attempts = attempts + 1,
+         op_key = coalesce(op_key, gen_random_uuid())
    where id = p_task_id and status = 'open'
-     and (apply_state in ('ready', 'failed') or (apply_state = 'applying' and claimed_at < now() - interval '2 minutes'));
+     and (apply_state in ('ready', 'failed') or (apply_state = 'applying' and claimed_at < now() - interval '2 minutes'))
+  returning * into t;
   if not found then
     return jsonb_build_object('ok', false, 'status', 'busy', 'error', 'Already being updated. Wait a moment, then check again.');
   end if;
@@ -250,12 +272,16 @@ begin
     values (t.id, q.id, t.source_id, t.stock_item_id, t.square_variation_id, q.old_price, q.proposed_price, g - 'object', 'conflict', v_by);
     return jsonb_build_object('ok', false, 'status', 'conflict', 'error', 'The register price was changed elsewhere. Josh needs to check this one.');
   else
-    w := price_square_put(t.square_variation_id, (g->>'version')::bigint, v_new, 'poppies-tag-' || t.id || '-' || v_new);
+    w := price_square_put(t.square_variation_id, (g->>'version')::bigint, v_new, 'poppies-tag-' || t.op_key);
   end if;
 
   if not coalesce((w->>'ok')::boolean, false) then
+    -- ambiguous outcome: keep op_key so a retry reuses it (and the read-before-write detects an applied price);
+    -- definite failure: drop op_key so the next attempt is a new operation
     update delivery_tasks set apply_state = case when coalesce((w->>'conflict')::boolean, false) then 'conflict' else 'failed' end,
-           apply_result = jsonb_build_object('stage', 'write', 'error', w->>'error') where id = p_task_id;
+           op_key = case when coalesce((w->>'ambiguous')::boolean, false) then op_key else null end,
+           apply_result = jsonb_build_object('stage', 'write', 'error', w->>'error', 'ambiguous', coalesce((w->>'ambiguous')::boolean, false))
+     where id = p_task_id;
     insert into price_apply_audit (task_id, proposal_id, source_id, stock_item_id, square_variation_id, expected_old, new_price, square_before, square_after, outcome, by)
     values (t.id, q.id, t.source_id, t.stock_item_id, t.square_variation_id, q.old_price, q.proposed_price, g - 'object', w, 'failed_write', v_by);
     return jsonb_build_object('ok', false, 'status', 'failed', 'error', 'The register didn''t take the new price. Try again.');
@@ -273,7 +299,7 @@ begin
   update stock_items set retail_sell_price = q.proposed_price where id = t.stock_item_id;
   update retail_price_history set pushed_to_square_at = now(), shelf_label_updated_at = now()
    where id = (select max(id) from retail_price_history where stock_item_id = t.stock_item_id);
-  v_parts := price_parts_apply(t.stock_item_id, t.id);
+  v_parts := price_parts_apply(q.parts, t.stock_item_id, t.id, t.op_key);
   update retail_price_proposal set status = 'applied', applied_at = now(), square_result = w || jsonb_build_object('parts', v_parts) where id = q.id;
   update delivery_tasks set status = 'done', apply_state = 'applied', done_by = v_by, done_at = now(),
          apply_result = jsonb_build_object('square_before', g->'cents', 'square_after', a->'cents', 'parts', v_parts)
@@ -468,7 +494,7 @@ declare f regprocedure;
 begin
   foreach f in array array['public.price_square_get(text)','public.price_square_put(text,bigint,integer,text)',
     'public.price_propose_for_tag(bigint,text,numeric,numeric,text,text,numeric,numeric,numeric,numeric,numeric,boolean,text,text,text,date,text,text,jsonb)',
-    'public.price_parts_apply(bigint,bigint)','public.delivery_tag_confirm(bigint,text)','public.delivery_task_tick(bigint,text)',
+    'public.price_parts_apply(jsonb,bigint,bigint,uuid)','public.delivery_tag_confirm(bigint,text)','public.delivery_task_tick(bigint,text)',
     'public.produce_price_items(text,bigint[],boolean)','public.delivery_price_decide(bigint,text,numeric,text)',
     'public.price_rules_scan(boolean)','public.price_proposal_apply(boolean)','public.delivery_tasks_list()']::regprocedure[] loop
     execute format('revoke execute on function %s from public, anon, authenticated', f);
