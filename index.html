@@ -47,7 +47,7 @@ tr.sub td{padding-top:0}
 </head>
 <body>
 <header><h1>Poppie's · New stock &amp; deliveries</h1><button onclick="homeScreen()">Home</button></header>
-<main id="app"></main>
+<div id="busy" style="max-width:920px;margin:0 auto;padding:0 20px"></div><main id="app"></main>
 <script>
 const API = "https://xcolpextsojdtbfscvse.supabase.co/functions/v1/delivery-app";
 const DEPTS = ["Garden","Gift Store","Grocer"];
@@ -68,7 +68,14 @@ async function api(path, opts = {}) {
   const r = await fetch(API + path, { ...opts, headers: { "content-type": "application/json", "x-device-key": KEY || "", ...(OWNER ? {"x-owner-key": OWNER} : {}) } });
   const b = await r.json().catch(() => ({}));
   if (r.status === 401) { noKey(); throw new Error("no key"); }
+  // 503 = the back end couldn't read its settings. The key may be fine: never show the setup screen for this.
+  if (r.status === 503) busyBanner(b && b.error);
   return { ok: r.ok, status: r.status, body: b };
+}
+function busyBanner(msg) {
+  let el = document.getElementById("busy");
+  if (!el) return;
+  el.innerHTML = `<div class="note err" style="margin:0 0 14px">${esc(msg || "The app can't reach its settings right now.")} <button class="secondary small" onclick="document.getElementById('busy').innerHTML='';homeScreen()">Try again</button></div>`;
 }
 function noKey(){ $(`<h2>This iPad isn't set up yet</h2><p>Ask Josh to open the setup link on this iPad once. After that it opens straight to the app.</p>`); }
 

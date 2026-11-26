@@ -33,17 +33,17 @@ function app(routes = {}) {
 }
 const settle = async (n = 4) => { for (let i = 0; i < n; i++) await new Promise(r => setImmediate(r)); };
 
-test("supplier names with apostrophes produce a valid onclick (Harvey's)", async () => {
+test("supplier names with apostrophes produce a valid onclick (Farmer's Co)", async () => {
   const { ctx, el } = app();
   await settle();
-  vm.runInContext(`SUP = { usual: ["Harvey's", 'Quote "Co"'], others: ["O'Brien & Sons"] }; S.dept = "Grocer";`, ctx);
+  vm.runInContext(`SUP = { usual: ["Farmer's Co", 'Quote "Co"'], others: ["O'Brien & Sons"] }; S.dept = "Grocer";`, ctx);
   el('sq').value = '';
   vm.runInContext('drawSup()', ctx);
   const calls = onclicks(el('sup').innerHTML);
   assert.equal(calls.length, 3);
   for (const c of calls) assert.doesNotThrow(() => new Function(c), c); // parses as JS
   vm.runInContext('photoScreen = () => {}', ctx);
-  vm.runInContext(calls[0], ctx); assert.equal(vm.runInContext('S.supplier', ctx), "Harvey's");
+  vm.runInContext(calls[0], ctx); assert.equal(vm.runInContext('S.supplier', ctx), "Farmer's Co");
   vm.runInContext(calls[1], ctx); assert.equal(vm.runInContext('S.supplier', ctx), 'Quote "Co"');
   vm.runInContext(calls[2], ctx); assert.equal(vm.runInContext('S.supplier', ctx), "O'Brien & Sons");
 });
@@ -92,7 +92,15 @@ test('a slow month reply cannot overwrite a month that was closed and reopened',
 });
 
 test('recent rows show authoritative booked and waiting counts', async () => {
-  const { el } = app({ '/recent-deliveries': async () => ({ recent: [{ kind: 'invoice', id: 's', supplier: 'Biodynamic', invoice_number: '1035493', date: '2026-11-26', depts: ['Grocer'], lines: 27, booked: 23, waiting: 4, open_jobs: 10 }], months: [] }) });
+  const { el } = app({ '/recent-deliveries': async () => ({ recent: [{ kind: 'invoice', id: 's', supplier: 'Supplier A', invoice_number: 'INV-0001', date: '2026-11-26', depts: ['Grocer'], lines: 27, booked: 23, waiting: 4, open_jobs: 10 }], months: [] }) });
   await settle(8);
   assert.match(el('recent').innerHTML, /27 lines · 23 booked · <b[^>]*>4 waiting<\/b>/);
+});
+
+test('a 503 (settings unavailable) shows a retry banner and never the "not set up" screen', async () => {
+  const { el } = app({ '/recent': async () => ({ __status: 503, body: { error: "The app can't reach its settings right now.", retry: true } }) });
+  await settle(8);
+  assert.match(el('busy').innerHTML, /can&#39;t reach its settings/);
+  assert.match(el('busy').innerHTML, /Try again/);
+  assert.doesNotMatch(el('app').innerHTML, /isn't set up yet/);
 });

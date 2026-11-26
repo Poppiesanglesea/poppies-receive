@@ -1,0 +1,11 @@
+{
+  "build": "delivery-app v15 2026-11-26",
+  "source_sha": {
+    "index": "6f1f7b17c6d3169ee5f379554bcafd6427c0b752ddd013dcdf94929886cbcdac",
+    "auth": "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331"
+  },
+  "file_sha256": {
+    "index.ts": "626dec0ca94d42227b5467a43942b9439a22481ac4c1205be2d4d6049c2505b7",
+    "auth.ts": "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331"
+  }
+}

@@ -1,4 +1,4 @@
-// delivery-app — Poppie's Anglesea "New stock" API. v13, 26 Nov 2026 (v8 25 Nov reviewed by Codex).
+// delivery-app — Poppie's Anglesea "New stock" API. v15, 26 Nov 2026 (v8 25 Nov reviewed by Codex).
 // Staff photograph the invoice/docket that comes with a delivery, correct/add/split lines, scan barcodes,
 // and send them for automatic product set-up (new-stock-setup). The photo flow NEVER books invoices or stock.
 // Exception (v9): a staff box count on the Deliveries screen maps an already-booked invoice line, which books that line's stock.
@@ -12,8 +12,16 @@
 // v11 (26 Nov 2026): GET /prices?q= — read-only shelf price lookup from live Square (delivery_price_search). Never writes.
 // v12 (26 Nov 2026): GET /prices/all — full shelf price list (Grocer, Gift Store, Garden) from delivery_price_cache, refreshed in the background when >10 min old. Never writes to Square.
 // v13 (26 Nov 2026): GET /recent-deliveries[?month=YYYY-MM] — all retail deliveries (invoices + app photos), last 14 days in full, older months folded (delivery_recent_list). Read-only.
+// v15 (26 Nov 2026): config-read failures fail closed as 503 (never cached, never reported as an invalid device);
+//   wrong/malformed keys stay 401 (auth.ts, tested in repo). Routes now surface DB errors instead of returning empty
+//   success. GET /health reports BUILD and SOURCE_SHA (embedded by scripts/check-edge.mjs) for deploy verification.
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import { PDFDocument } from "npm:pdf-lib@1.17.1";
+import { ConfigUnavailable, makeCfg, whoFromHeaders } from "./auth.ts";
+
+export const BUILD = "delivery-app v15 2026-11-26";
+// SOURCE_SHA is written by scripts/check-edge.mjs --write: sha-256 of index.ts (with this one line removed) and auth.ts.
+export const SOURCE_SHA = { index: "6f1f7b17c6d3169ee5f379554bcafd6427c0b752ddd013dcdf94929886cbcdac", auth: "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331" };
 
 const URL_ = Deno.env.get("SUPABASE_URL")!;
 const SB = createClient(URL_, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
@@ -27,24 +35,13 @@ const CORS = {
 };
 const json = (b: unknown, s = 200) => new Response(JSON.stringify(b), { status: s, headers: { ...CORS, "Content-Type": "application/json" } });
 
-const cache: Record<string, { v: string; at: number }> = {};
-async function cfg(key: string) {
-  const c = cache[key];
-  if (c && Date.now() - c.at < 60000) return c.v;
-  const { data } = await SB.from("app_config").select("value").eq("key", key).maybeSingle();
-  cache[key] = { v: data?.value ?? "", at: Date.now() };
-  return cache[key].v;
-}
-function eq(a: string, b: string) {
-  if (!a || !b || a.length !== b.length) return false;
-  let r = 0; for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i); return r === 0;
-}
-async function who(req: Request) {
-  const dk = req.headers.get("x-device-key") ?? "", ok = req.headers.get("x-owner-key") ?? "";
-  const owner = /^[0-9a-f]{48}$/.test(ok) && eq(ok, await cfg("delivery_owner_key"));
-  const device = owner || (/^[0-9a-f]{48}$/.test(dk) && eq(dk, await cfg("delivery_device_key")));
-  return { device, owner };
-}
+const cfg = makeCfg(async (key) => {
+  const { data, error } = await SB.from("app_config").select("value").eq("key", key).maybeSingle();
+  return { value: data?.value ?? null, error };
+});
+const who = (req: Request) => whoFromHeaders(req.headers, cfg);
+const unavailable = () => json({ error: "The app can't reach its settings right now. Wait a moment and try again.", retry: true }, 503);
+
 function b64ToBytes(b64: string) { const s = atob(b64.replace(/^data:[^,]+,/, "")); const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; }
 function bytesToB64(u: Uint8Array) { let s = ""; for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode(...u.subarray(i, i + 0x8000)); return btoa(s); }
 function setup(body: unknown) {
@@ -100,17 +97,22 @@ Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
   const path = new URL(req.url).pathname.replace(/^.*\/delivery-app/, "") || "/";
   try {
+    if (req.method === "GET" && path === "/health") {
+      return json({ ok: true, build: BUILD, source_sha: SOURCE_SHA });
+    }
     const w = await who(req);
     if (!w.device) return json({ error: "This device isn't set up. Ask Josh for the setup link." }, 401);
 
     if (path.startsWith("/owner")) {
       if (!w.owner) return json({ error: "owner only" }, 403);
       if (req.method === "GET" && path === "/owner/needs") {
-        const { data } = await SB.from("new_stock_lines").select("id, input, decision, price, note, status, receipt_id, delivery_receipts!inner(supplier, department, created_at, is_fixture)").eq("delivery_receipts.is_fixture", false).in("status", ["needs_josh", "failed", "square_created"]).order("id", { ascending: false }).limit(100);
+        const { data, error } = await SB.from("new_stock_lines").select("id, input, decision, price, note, status, receipt_id, delivery_receipts!inner(supplier, department, created_at, is_fixture)").eq("delivery_receipts.is_fixture", false).in("status", ["needs_josh", "failed", "square_created"]).order("id", { ascending: false }).limit(100);
+        if (error) return json({ error: "Couldn't load products waiting for a price." }, 500);
         return json(data ?? []);
       }
       if (req.method === "GET" && path === "/owner/awaiting") {
-        const { data } = await SB.from("v_new_stock_awaiting_price").select("line_id, supplier, department, item, variation, sku, unit_cost_ex, days_waiting").order("applied_at").limit(200);
+        const { data, error } = await SB.from("v_new_stock_awaiting_price").select("line_id, supplier, department, item, variation, sku, unit_cost_ex, days_waiting").order("applied_at").limit(200);
+        if (error) return json({ error: "Couldn't load products waiting for a price." }, 500);
         return json(data ?? []);
       }
       if (req.method === "POST" && path === "/owner/price") {
@@ -186,7 +188,8 @@ Deno.serve(async (req) => {
       const id = Number(tm[1]);
       if (req.method === "GET" && tm[2] === "search") {
         const q = new URL(req.url).searchParams.get("q") ?? "";
-        const { data: t } = await SB.from("delivery_tasks").select("unmatched_id").eq("id", id).eq("kind", "count").maybeSingle();
+        const { data: t, error: tErr } = await SB.from("delivery_tasks").select("unmatched_id").eq("id", id).eq("kind", "count").maybeSingle();
+        if (tErr) return json({ error: "Couldn't load this job." }, 500);
         if (!t) return json({ error: "not found" }, 404);
         const { data, error } = await SB.rpc("delivery_item_search", { p_unmatched_id: t.unmatched_id, p_q: q });
         if (error) return json({ error: error.message }, 500);
@@ -254,7 +257,8 @@ Deno.serve(async (req) => {
 
     const m = path.match(/^\/receipts\/([0-9a-f-]{36})(\/submit|\/cancel|\/items)?$/);
     if (m) {
-      const { data: rec } = await SB.from("delivery_receipts").select("*").eq("id", m[1]).maybeSingle();
+      const { data: rec, error: recErr } = await SB.from("delivery_receipts").select("*").eq("id", m[1]).maybeSingle();
+      if (recErr) return json({ error: "Couldn't load this delivery." }, 500);
       if (!rec) return json({ error: "not found" }, 404);
 
       if (req.method === "GET" && !m[2]) {
@@ -273,8 +277,9 @@ Deno.serve(async (req) => {
       }
 
       if (req.method === "GET" && m[2] === "/items") {
-        const { data } = await SB.from("new_stock_lines").select("id, line_no, input, status, sku, result, note, awaiting_price").eq("receipt_id", rec.id).order("line_no");
-        const { data: aw } = await SB.from("v_new_stock_awaiting_price").select("line_id").eq("receipt_id", rec.id);
+        const { data, error } = await SB.from("new_stock_lines").select("id, line_no, input, status, sku, result, note, awaiting_price").eq("receipt_id", rec.id).order("line_no");
+        const { data: aw, error: awErr } = await SB.from("v_new_stock_awaiting_price").select("line_id").eq("receipt_id", rec.id);
+        if (error || awErr) return json({ error: "Couldn't load this delivery's products." }, 500);
         const waiting = new Set((aw ?? []).map((a) => a.line_id));
         // price_state: "awaiting" = in Square with no price yet (don't print labels); "priced" = Josh has since priced it in Square
         const lines = (data ?? []).map(({ id, ...l }) => ({ ...l, price_state: l.awaiting_price ? (waiting.has(id) ? "awaiting" : "priced") : null }));
@@ -308,15 +313,18 @@ Deno.serve(async (req) => {
 
     if (req.method === "GET" && path === "/recent") {
       sweepSoon();
-      const { data } = await SB.from("delivery_receipts").select("id, supplier, department, status, setup_status, created_at").eq("is_fixture", false).neq("status", "cancelled").order("created_at", { ascending: false }).limit(20);
+      const { data, error } = await SB.from("delivery_receipts").select("id, supplier, department, status, setup_status, created_at").eq("is_fixture", false).neq("status", "cancelled").order("created_at", { ascending: false }).limit(20);
+      if (error) return json({ error: "Couldn't load recent deliveries." }, 500);
       const ids = (data ?? []).filter((r) => r.setup_status === "ready").map((r) => r.id);
-      const { data: aw } = ids.length ? await SB.from("v_new_stock_awaiting_price").select("receipt_id").in("receipt_id", ids) : { data: [] };
+      const { data: aw, error: awErr } = ids.length ? await SB.from("v_new_stock_awaiting_price").select("receipt_id").in("receipt_id", ids) : { data: [], error: null };
+      if (awErr) return json({ error: "Couldn't load recent deliveries." }, 500);
       const waiting = new Set((aw ?? []).map((a) => a.receipt_id));
       const items = (data ?? []).map((r) => waiting.has(r.id) ? { ...r, setup_status: "awaiting_price" } : r);
       return json({ owner: w.owner, items });
     }
     return json({ error: "not found" }, 404);
   } catch (e) {
+    if (e instanceof ConfigUnavailable) return unavailable();
     return json({ error: String((e as Error).message ?? e).slice(0, 300) }, 500);
   }
 });

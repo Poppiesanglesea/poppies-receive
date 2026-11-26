@@ -7,7 +7,7 @@ import vm from 'node:vm';
 const script = readFileSync(new URL('../index.html', import.meta.url), 'utf8').match(/<script>([\s\S]*?)<\/script>/)[1];
 
 const card = {
-  source_id: 'inv-1', supplier: 'Biodynamic', invoice_number: '1035493', invoice_date: '2026-11-26', open: 3,
+  source_id: 'inv-1', supplier: 'Supplier A', invoice_number: 'INV-0001', invoice_date: '2026-11-26', open: 3,
   tasks: [
     { id: 1, kind: 'tag', status: 'open', info: { name: 'Beetroots – Gold (Organic)', old: 9.4, new: 7.2, per: 'per kg' } },
     { id: 2, kind: 'count', status: 'open', info: { description: 'Leeks DEC - Foothill', qty: 1, unit: 'DEC', unit_price: 60 },
