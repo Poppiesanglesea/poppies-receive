@@ -168,3 +168,11 @@ test('Josh sees the box-size question and can make it the usual', async () => {
   const d = a.requests.find(r => r.url.endsWith('/owner/tasks/9/decide'));
   assert.equal(d.body.decision, 'approve');
 });
+
+test('a practice delivery says clearly that nothing changes', async () => {
+  const a = app();
+  await a.run('fetchDeliveries()');
+  a.run("DLV.cards[0].practice = true; deliveryScreen('inv-1')");
+  assert.match(a.el('app').innerHTML, /PRACTICE DELIVERY/);
+  assert.doesNotMatch(a.el('app').innerHTML, /Prices are already changed in Square/);
+});

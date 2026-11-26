@@ -196,7 +196,8 @@ function deliveryScreen(sid, msg) {
   if (!c) return homeScreen();
   S.delivery = sid; S.view = "delivery";
   const tags = jobs(c, ["tag"]), counts = jobs(c, ["count"]), holds = jobs(c, ["hold", "noprice"]);
-  $(`<h2>${esc(c.supplier)} · ${esc(dday(c.invoice_date))}</h2><p class="q">Invoice ${esc(c.invoice_number || "")}. Prices are already changed in Square. This list updates as jobs are done.</p>
+  $(`<h2>${esc(c.supplier)} · ${esc(dday(c.invoice_date))}</h2><p class="q">${c.practice ? "Practice run." : `Invoice ${esc(c.invoice_number || "")}. Prices are already changed in Square.`} This list updates as jobs are done.</p>
+   ${c.practice ? `<div class="note">PRACTICE DELIVERY — try anything here. Nothing changes in Square, stock or costs. Josh will remove it when you're done.</div>` : ""}
    ${msg ? `<div class="note ${msg.ok ? "ok" : "err"}">${esc(msg.text)}</div>` : ""}
    ${tags.length ? `<div class="card"><h3 style="margin-top:0">Change these shelf tags</h3><table><thead><tr><th>Product</th><th>Was</th><th>Now</th><th></th></tr></thead><tbody>
      ${tags.map(t => `<tr><td>${esc(t.info.name)}</td><td class="muted">${money(t.info.old)}</td><td><b>${money(t.info.new)}</b> ${esc(t.info.per || "")}</td>
