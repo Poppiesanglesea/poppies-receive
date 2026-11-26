@@ -36,7 +36,7 @@ test('shows all retail deliveries with invoice detail, open jobs and photo statu
   assert.ok(reqs.every(r => r.method === 'GET'));
   const h = el('recent').innerHTML;
   assert.match(h, /Biodynamic/); assert.match(h, /#1035493 · 27 lines · 10 booked/); assert.match(h, /10 jobs open/);
-  assert.match(h, /in Square — print labels/); assert.match(h, /itemsScreen\('11111111/);
+  assert.match(h, /in Square — print labels/); assert.match(h, /onclick="itemsScreen\(&quot;11111111-2222-3333-4444-555555555555&quot;\)"/);
   assert.match(h, /Garden &lt;Co&gt;/); assert.doesNotMatch(h, /Garden <Co>/);
   assert.match(el('months').innerHTML, /1 delivery ▸/);
 });

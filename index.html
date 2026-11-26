@@ -59,7 +59,10 @@ const DEPTS = ["Garden","Gift Store","Grocer"];
 })();
 let KEY = null, OWNER = null; try { KEY = localStorage.getItem("pd_key"); OWNER = localStorage.getItem("pd_owner"); } catch(e) {}
 let S = { dept: "Garden", supplier: null, photos: [], receipt: null };
-const $ = (h) => { document.getElementById("app").innerHTML = h; window.scrollTo(0,0); };
+let VIEW = 0; // bumped on every screen render; async work started on an older screen must not write into a newer one
+const $ = (h) => { VIEW++; document.getElementById("app").innerHTML = h; window.scrollTo(0,0); };
+// JS string literal for use inside a double-quoted onclick="..." (JSON for JS, then HTML-escaped for the attribute)
+const ja = (v) => esc(JSON.stringify(String(v ?? "")));
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 async function api(path, opts = {}) {
   const r = await fetch(API + path, { ...opts, headers: { "content-type": "application/json", "x-device-key": KEY || "", ...(OWNER ? {"x-owner-key": OWNER} : {}) } });
@@ -74,17 +77,19 @@ let idleT; function idle(){ clearTimeout(idleT); idleT = setTimeout(() => { if (
 async function homeScreen() {
   if (!KEY && !OWNER) return noKey();
   S = { dept: S.dept, supplier: null, photos: [], receipt: null }; WHO = null;
-  $(`<div id="own"></div><div class="row" style="margin:0 0 18px"><button class="big" style="width:auto;padding:14px 22px" onclick="pricesScreen()">Shelf prices</button></div><div id="dlv"></div><h2>New delivery</h2><p class="q">Which department is it for?</p>
+  $(`<div id="own"><div id="own-josh"></div><div id="own-needs"></div></div><div class="row" style="margin:0 0 18px"><button class="big" style="width:auto;padding:14px 22px" onclick="pricesScreen()">Shelf prices</button></div><div id="dlv"></div><h2>New delivery</h2><p class="q">Which department is it for?</p>
   <div class="grid">${DEPTS.map(d=>`<button class="big" onclick="S.dept='${d}';supplierScreen()">${d}</button>`).join("")}</div>
   <h2 style="margin-top:28px">Recent deliveries</h2><p class="muted" style="margin:-8px 0 6px">All retail deliveries from the last 14 days. Tap a <span class="tag">photo</span> one to see its new products and print labels.</p>
   <div class="row" style="margin:0 0 6px">${["All", ...DEPTS].map(d => `<button id="rd-${d.replace(" ","")}" class="secondary small" onclick="RD.dept='${d}';drawRecent()">${d}</button>`).join("")}</div>
   <div class="list" id="recent"><span class="muted">Loading…</span></div><div id="months"></div>`);
   loadDeliveries();
+  const v = VIEW;
   const [r, rd] = await Promise.all([api("/recent"), api("/recent-deliveries")]);
+  if (v !== VIEW || !document.getElementById("recent")) return; // navigated away while loading
   RD.photos = {}; for (const x of ((r.body && r.body.items) || [])) RD.photos[x.id] = x;
   RD.recent = (rd.ok && rd.body.recent) || []; RD.months = (rd.ok && rd.body.months) || []; RD.open = {}; RD.err = !rd.ok;
   drawRecent();
-  if (r.body && r.body.owner) document.getElementById("own").innerHTML = `<div class="row" style="margin:0 0 18px"><button class="secondary" onclick="needsScreen()">Josh: products waiting for a price</button></div>`;
+  if (r.body && r.body.owner) document.getElementById("own-needs").innerHTML = `<div class="row" style="margin:0 0 18px"><button class="secondary" onclick="needsScreen()">Josh: products waiting for a price</button></div>`;
 }
 
 // ---------- shelf prices: retail produce list (read-only; copy of Square refreshed every ~10 min)
@@ -167,26 +172,31 @@ function rdRow(x) {
   const p = x.kind === "photo" ? RD.photos[x.id] : null;
   const what = x.kind === "photo"
     ? `<span class="tag">photo</span> ${esc(p ? label(p) : "set-up")}`
-    : `${x.invoice_number ? "#" + esc(x.invoice_number) + " · " : ""}${x.lines} line${x.lines === 1 ? "" : "s"}${x.booked != null && x.booked < x.lines ? ` · ${x.booked} booked` : ""}${x.open_jobs ? ` · <b style="color:var(--warn)">${x.open_jobs} job${x.open_jobs === 1 ? "" : "s"} open</b>` : ""}`;
-  const tap = x.kind === "photo" && p && p.status === "submitted" ? ` onclick="itemsScreen('${esc(x.id)}')" style="cursor:pointer"` : "";
+    : `${x.invoice_number ? "#" + esc(x.invoice_number) + " · " : ""}${x.lines} line${x.lines === 1 ? "" : "s"}${x.booked != null && x.booked < x.lines ? ` · ${x.booked} booked` : ""}${x.waiting ? ` · <b style="color:var(--warn)">${x.waiting} waiting</b>` : ""}${x.open_jobs ? ` · <b style="color:var(--warn)">${x.open_jobs} job${x.open_jobs === 1 ? "" : "s"} open</b>` : ""}`;
+  const tap = x.kind === "photo" && p && p.status === "submitted" ? ` onclick="itemsScreen(${ja(x.id)})" style="cursor:pointer"` : "";
   return `<div${tap}><span>${esc(x.supplier || "Unknown supplier")} <span class="muted">· ${esc((x.depts || []).join(", "))}</span></span><span class="muted" style="text-align:right">${what} · ${dayFmt(x.date)}</span></div>`;
 }
 function drawRecent() {
+  if (!document.getElementById("recent") || !document.getElementById("months")) return;
   for (const d of ["All", ...DEPTS]) { const b = document.getElementById("rd-" + d.replace(" ", "")); if (b) b.className = (d === RD.dept ? "primary" : "secondary") + " small"; }
   const rows = RD.recent.filter(rdShow);
   document.getElementById("recent").innerHTML = RD.err ? `<span class="muted">Couldn't load deliveries. Try Home again in a minute.</span>`
     : rows.map(rdRow).join("") || `<span class="muted">No ${RD.dept === "All" ? "retail" : esc(RD.dept)} deliveries in the last 14 days.</span>`;
   document.getElementById("months").innerHTML = RD.months.map(m => {
     const o = RD.open[m.month], list = o && o.rows ? o.rows.filter(rdShow) : null;
-    return `<div class="card" style="margin:10px 0 0;padding:10px 14px"><div onclick="toggleMonth('${esc(m.month)}')" style="cursor:pointer;display:flex;justify-content:space-between"><b>${esc(monthFmt(m.month))}</b><span class="muted">${m.count} deliver${m.count === 1 ? "y" : "ies"} ${o ? "▾" : "▸"}</span></div>
-      ${o ? `<div class="list" style="margin-top:6px">${o.loading ? '<span class="muted">Loading…</span>' : (list.map(rdRow).join("") || `<span class="muted">None for ${esc(RD.dept)}.</span>`)}</div>` : ""}</div>`;
+    return `<div class="card" style="margin:10px 0 0;padding:10px 14px"><div onclick="toggleMonth(${ja(m.month)})" style="cursor:pointer;display:flex;justify-content:space-between"><b>${esc(monthFmt(m.month))}</b><span class="muted">${m.count} deliver${m.count === 1 ? "y" : "ies"} ${o ? "▾" : "▸"}</span></div>
+      ${o ? `<div class="list" style="margin-top:6px">${o.loading ? '<span class="muted">Loading…</span>' : o.error ? `<span class="muted">Couldn't load this month. Tap the month to close it and try again.</span>` : (list.map(rdRow).join("") || `<span class="muted">None for ${esc(RD.dept)}.</span>`)}</div>` : ""}</div>`;
   }).join("");
 }
+let RD_SEQ = 0;
 async function toggleMonth(m) {
   if (RD.open[m]) { delete RD.open[m]; return drawRecent(); }
-  RD.open[m] = { loading: true }; drawRecent();
-  const r = await api("/recent-deliveries?month=" + encodeURIComponent(m));
-  RD.open[m] = { rows: (r.ok && r.body.rows) || [] }; drawRecent();
+  const seq = ++RD_SEQ, v = VIEW;
+  RD.open[m] = { loading: true, seq }; drawRecent();
+  let r; try { r = await api("/recent-deliveries?month=" + encodeURIComponent(m)); } catch (e) { r = { ok: false, body: {} }; }
+  if (v !== VIEW || !RD.open[m] || RD.open[m].seq !== seq) return; // closed, reopened or navigated away meanwhile
+  RD.open[m] = r.ok && Array.isArray(r.body && r.body.rows) ? { rows: r.body.rows, seq } : { error: true, seq };
+  if (document.getElementById("months")) drawRecent();
 }
 
 function label(x){
@@ -213,19 +223,21 @@ async function fetchDeliveries() {
   if (r.ok) DLV = r.body; return r.ok;
 }
 async function loadDeliveries() {
-  const box = document.getElementById("dlv"); if (!box) return;
+  const v = VIEW, box0 = document.getElementById("dlv"); if (!box0) return;
   if (!(await fetchDeliveries())) return;
+  if (v !== VIEW) return; // navigated away while loading
+  const box = document.getElementById("dlv"); if (!box) return;
   const open = DLV.cards.filter(c => openJobs(c, ["tag", "count"]).length);
-  const own = document.getElementById("own");
+  const own = document.getElementById("own-josh");
   const josh = DLV.cards.reduce((n, c) => n + openJobs(c, ["hold", "noprice", "boxsize"]).length, 0);
-  if (DLV.owner && own) own.insertAdjacentHTML("afterbegin", `<div class="row" style="margin:0 0 10px"><button class="secondary" onclick="joshScreen()">Josh: price decisions${josh ? ` (${josh})` : ""}</button></div>`);
+  if (DLV.owner && own) own.innerHTML = `<div class="row" style="margin:0 0 10px"><button class="secondary" onclick="joshScreen()">Josh: price decisions${josh ? ` (${josh})` : ""}</button></div>`;
   const others = DLV.cards.filter(c => !openJobs(c, ["tag", "count"]).length && (c.boxes || []).length);
   box.innerHTML = (open.length ? `<h2>Deliveries to finish</h2><div class="grid" style="margin-bottom:${others.length ? 10 : 24}px">${open.map(c => {
       const t = openJobs(c, ["tag"]).length, n = openJobs(c, ["count"]).length;
-      return `<button class="big" onclick="deliveryScreen('${esc(c.source_id)}')"><b>${esc(c.supplier)}</b><br><span class="muted">${esc(dday(c.invoice_date))}</span><br>${[t ? t + " tag" + (t > 1 ? "s" : "") : "", n ? n + " to count" : ""].filter(Boolean).join(" · ")}</button>`;
+      return `<button class="big" onclick="deliveryScreen(${ja(c.source_id)})"><b>${esc(c.supplier)}</b><br><span class="muted">${esc(dday(c.invoice_date))}</span><br>${[t ? t + " tag" + (t > 1 ? "s" : "") : "", n ? n + " to count" : ""].filter(Boolean).join(" · ")}</button>`;
     }).join("")}</div>` : "")
     + (others.length ? `<p class="muted" style="margin:0 0 6px">Other recent deliveries — open one if a box wasn't the usual size:</p><div class="row" style="margin:0 0 24px">${others.map(c =>
-      `<button class="secondary small" onclick="deliveryScreen('${esc(c.source_id)}')">${esc(c.supplier)} · ${esc(dday(c.invoice_date))}</button>`).join("")}</div>` : "");
+      `<button class="secondary small" onclick="deliveryScreen(${ja(c.source_id)})">${esc(c.supplier)} · ${esc(dday(c.invoice_date))}</button>`).join("")}</div>` : "");
 }
 const num = (v) => String(Number(v));
 function boxRow(b) {
@@ -389,7 +401,7 @@ function drawSup() {
   const q = (document.getElementById("sq").value || "").toLowerCase();
   const f = a => a.filter(n => n.toLowerCase().includes(q));
   const u = f(SUP.usual), o = f(SUP.others);
-  const btn = n => `<button class="big" onclick='S.supplier=${JSON.stringify(n)};photoScreen()'>${esc(n)}</button>`;
+  const btn = n => `<button class="big" onclick="S.supplier=${ja(n)};photoScreen()">${esc(n)}</button>`;
   const head = t => `<div style="grid-column:1/-1" class="muted">${t}</div>`;
   document.getElementById("sup").innerHTML = (u.length || o.length) ? (u.length ? head("Usual for " + esc(S.dept)) + u.map(btn).join("") : "") + (o.length ? head("All other suppliers") + o.map(btn).join("") : "") :
     `<div class="note" style="grid-column:1/-1">Not found. Leave the paperwork on Josh's desk — it may be a new supplier.</div>`;
