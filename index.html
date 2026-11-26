@@ -76,11 +76,14 @@ async function homeScreen() {
   S = { dept: S.dept, supplier: null, photos: [], receipt: null }; WHO = null;
   $(`<div id="own"></div><div class="row" style="margin:0 0 18px"><button class="big" style="width:auto;padding:14px 22px" onclick="pricesScreen()">Shelf prices</button></div><div id="dlv"></div><h2>New delivery</h2><p class="q">Which department is it for?</p>
   <div class="grid">${DEPTS.map(d=>`<button class="big" onclick="S.dept='${d}';supplierScreen()">${d}</button>`).join("")}</div>
-  <h2 style="margin-top:28px">Recent deliveries</h2><p class="muted" style="margin:-8px 0 6px">Tap one to see its new products and print labels.</p><div class="list" id="recent"><span class="muted">Loading…</span></div>`);
+  <h2 style="margin-top:28px">Recent deliveries</h2><p class="muted" style="margin:-8px 0 6px">All retail deliveries from the last 14 days. Tap a <span class="tag">photo</span> one to see its new products and print labels.</p>
+  <div class="row" style="margin:0 0 6px">${["All", ...DEPTS].map(d => `<button id="rd-${d.replace(" ","")}" class="secondary small" onclick="RD.dept='${d}';drawRecent()">${d}</button>`).join("")}</div>
+  <div class="list" id="recent"><span class="muted">Loading…</span></div><div id="months"></div>`);
   loadDeliveries();
-  const r = await api("/recent");
-  const items = (r.body && r.body.items) || [];
-  document.getElementById("recent").innerHTML = items.map(x => `<div onclick="${x.status==='submitted'?`itemsScreen('${x.id}')`:''}" style="cursor:pointer"><span>${esc(x.supplier)} · ${esc(x.department)}</span><span class="muted">${esc(label(x))} · ${new Date(x.created_at).toLocaleDateString("en-AU",{day:"numeric",month:"short"})}</span></div>`).join("") || `<span class="muted">Nothing yet.</span>`;
+  const [r, rd] = await Promise.all([api("/recent"), api("/recent-deliveries")]);
+  RD.photos = {}; for (const x of ((r.body && r.body.items) || [])) RD.photos[x.id] = x;
+  RD.recent = (rd.ok && rd.body.recent) || []; RD.months = (rd.ok && rd.body.months) || []; RD.open = {}; RD.err = !rd.ok;
+  drawRecent();
   if (r.body && r.body.owner) document.getElementById("own").innerHTML = `<div class="row" style="margin:0 0 18px"><button class="secondary" onclick="needsScreen()">Josh: products waiting for a price</button></div>`;
 }
 
@@ -155,6 +158,37 @@ async function setPrice(id) {
   const res = (r.body && r.body.result) || {};
   m.innerHTML = r.ok ? `<div class="note ok">${esc(res.status === "created" ? "Created in Square." : res.status === "dry_run" ? "Test mode: recorded, not created in Square." : (res.status || "Done"))}</div>` : `<div class="note err">${esc(r.body.error || "Couldn't save")}</div>`;
 }
+// ---------- recent deliveries (all retail; last 14 days in full, older months folded)
+let RD = { dept: "All", recent: [], months: [], open: {}, photos: {}, err: false };
+const dayFmt = (d) => new Date(d + "T00:00:00").toLocaleDateString("en-AU", { weekday: "short", day: "numeric", month: "short" });
+const monthFmt = (m) => new Date(m + "-01T00:00:00").toLocaleDateString("en-AU", { month: "long", year: "numeric" });
+function rdShow(x) { return RD.dept === "All" || (x.depts || []).includes(RD.dept); }
+function rdRow(x) {
+  const p = x.kind === "photo" ? RD.photos[x.id] : null;
+  const what = x.kind === "photo"
+    ? `<span class="tag">photo</span> ${esc(p ? label(p) : "set-up")}`
+    : `${x.invoice_number ? "#" + esc(x.invoice_number) + " · " : ""}${x.lines} line${x.lines === 1 ? "" : "s"}${x.booked != null && x.booked < x.lines ? ` · ${x.booked} booked` : ""}${x.open_jobs ? ` · <b style="color:var(--warn)">${x.open_jobs} job${x.open_jobs === 1 ? "" : "s"} open</b>` : ""}`;
+  const tap = x.kind === "photo" && p && p.status === "submitted" ? ` onclick="itemsScreen('${esc(x.id)}')" style="cursor:pointer"` : "";
+  return `<div${tap}><span>${esc(x.supplier || "Unknown supplier")} <span class="muted">· ${esc((x.depts || []).join(", "))}</span></span><span class="muted" style="text-align:right">${what} · ${dayFmt(x.date)}</span></div>`;
+}
+function drawRecent() {
+  for (const d of ["All", ...DEPTS]) { const b = document.getElementById("rd-" + d.replace(" ", "")); if (b) b.className = (d === RD.dept ? "primary" : "secondary") + " small"; }
+  const rows = RD.recent.filter(rdShow);
+  document.getElementById("recent").innerHTML = RD.err ? `<span class="muted">Couldn't load deliveries. Try Home again in a minute.</span>`
+    : rows.map(rdRow).join("") || `<span class="muted">No ${RD.dept === "All" ? "retail" : esc(RD.dept)} deliveries in the last 14 days.</span>`;
+  document.getElementById("months").innerHTML = RD.months.map(m => {
+    const o = RD.open[m.month], list = o && o.rows ? o.rows.filter(rdShow) : null;
+    return `<div class="card" style="margin:10px 0 0;padding:10px 14px"><div onclick="toggleMonth('${esc(m.month)}')" style="cursor:pointer;display:flex;justify-content:space-between"><b>${esc(monthFmt(m.month))}</b><span class="muted">${m.count} deliver${m.count === 1 ? "y" : "ies"} ${o ? "▾" : "▸"}</span></div>
+      ${o ? `<div class="list" style="margin-top:6px">${o.loading ? '<span class="muted">Loading…</span>' : (list.map(rdRow).join("") || `<span class="muted">None for ${esc(RD.dept)}.</span>`)}</div>` : ""}</div>`;
+  }).join("");
+}
+async function toggleMonth(m) {
+  if (RD.open[m]) { delete RD.open[m]; return drawRecent(); }
+  RD.open[m] = { loading: true }; drawRecent();
+  const r = await api("/recent-deliveries?month=" + encodeURIComponent(m));
+  RD.open[m] = { rows: (r.ok && r.body.rows) || [] }; drawRecent();
+}
+
 function label(x){
   if (x.status === "submitted") return ({pending:"being set up", ready:"in Square — print labels", awaiting_price:"in Square — some waiting for a price", needs_josh:"waiting on Josh", failed:"problem — Josh notified", dry_run:"test run only (not in Square)", empty:"nothing new to set up"})[x.setup_status] || "sent";
   return ({reading:"being read", ready:"waiting for a check", error:"problem"})[x.status] || x.status;
