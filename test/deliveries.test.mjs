@@ -108,3 +108,63 @@ test('Josh can keep a held price from his list', async () => {
   const d = a.requests.find(r => r.url.endsWith('/owner/tasks/3/decide'));
   assert.deepEqual(d.body, { decision: 'keep', price: null });
 });
+
+// ---- box sizes (26 Nov 2026): only box lines are listed; staff fix one delivery; Josh decides the usual size
+function boxApp({ owner = false } = {}) {
+  const withBoxes = structuredClone(card);
+  withBoxes.boxes = [{ line_id: 77, stock_item_id: 2328, name: 'Mushrooms – Flat', description: 'Mushroom White Flat', qty: 1, unit: 'Box', count_unit: 'kg', usual: 4, report: null }];
+  withBoxes.tasks.push({ id: 9, kind: 'boxsize', status: 'open', info: { name: 'Mushrooms - Flat (Retail)', unit: 'box', count_unit: 'kg', usual: 4, actual: 3.5, reported_by: 'Fern' } });
+  const elements = new Map(); const requests = [];
+  const el = id => { if (!elements.has(id)) elements.set(id, { value: '', innerHTML: '', disabled: false, dataset: {}, textContent: '', insertAdjacentHTML() {} }); return elements.get(id); };
+  const ctx = vm.createContext({
+    location: { hash: '' }, localStorage: { getItem: () => 'a'.repeat(48) }, window: { scrollTo() {} },
+    document: { getElementById: el, addEventListener() {}, querySelector: () => null },
+    fetch: async (url, options) => {
+      requests.push({ url, method: options?.method || 'GET', body: options?.body ? JSON.parse(options.body) : null });
+      if (url.endsWith('/deliveries')) return { ok: true, status: 200, json: async () => ({ owner, staff: ['Fern'], cards: [structuredClone(withBoxes)] }) };
+      return { ok: true, status: 200, json: async () => ({ ok: true, status: 'recorded' }) };
+    },
+  });
+  vm.runInContext(script, ctx);
+  return { run: c => vm.runInContext(c, ctx), requests, el };
+}
+
+test('box lines show a "Different size?" option with the usual size', async () => {
+  const a = boxApp();
+  await a.run('fetchDeliveries()');
+  a.run("deliveryScreen('inv-1')");
+  const html = a.el('app').innerHTML;
+  assert.match(html, /Boxes on this delivery/);
+  assert.match(html, /usually 4 kg in each/);
+  assert.match(html, /Different size\?/);
+});
+
+test('reporting a box sends what was in it and who checked', async () => {
+  const a = boxApp();
+  await a.run('fetchDeliveries()');
+  a.run("deliveryScreen('inv-1'); WHO='Fern'; openBox(77)");
+  a.el('bv77').value = '3.5';
+  await a.run('saveBox(77)');
+  const sent = a.requests.find(r => r.url.endsWith('/deliveries/inv-1/boxes/77/report'));
+  assert.deepEqual(sent.body, { actual: 3.5, by: 'Fern' });
+});
+
+test('an empty box report is not sent', async () => {
+  const a = boxApp();
+  await a.run('fetchDeliveries()');
+  a.run("deliveryScreen('inv-1'); WHO='Fern'; openBox(77)");
+  a.el('bv77').value = '';
+  a.run('saveBox(77)');
+  assert.equal(a.requests.filter(r => r.url.includes('/boxes/')).length, 0);
+});
+
+test('Josh sees the box-size question and can make it the usual', async () => {
+  const a = boxApp({ owner: true });
+  await a.run('joshScreen()');
+  const html = a.el('app').innerHTML;
+  assert.match(html, /Box sizes/);
+  assert.match(html, /Make 3\.5 kg the usual/);
+  await a.run("decide(9, 'approve')");
+  const d = a.requests.find(r => r.url.endsWith('/owner/tasks/9/decide'));
+  assert.equal(d.body.decision, 'approve');
+});
