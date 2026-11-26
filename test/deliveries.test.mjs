@@ -60,14 +60,25 @@ test('a count far from the last box needs a recount before it is saved', async (
   assert.deepEqual(sent.body, { stock_item_id: 1860, count: 12, by: 'Fern' });
 });
 
-test('"None of these" sends the count with no product, for Josh to set up', async () => {
+test('"None of these" sends the count and what was counted, with no product, for Josh to set up', async () => {
   const a = app({ checked: { value: '', dataset: { unit: '', last: '' } } });
   await a.run('fetchDeliveries()');
   a.run("deliveryScreen('inv-1'); WHO='Rach'");
-  a.el('n2').value = '20';
+  a.el('n2').value = '4';
+  a.el('us2').value = 'kg';
   await a.run('saveCount(2)');
   const sent = a.requests.find(r => r.url.endsWith('/tasks/2/count'));
-  assert.deepEqual(sent.body, { stock_item_id: null, count: 20, by: 'Rach' });
+  assert.deepEqual(sent.body, { stock_item_id: null, count: 4, by: 'Rach', note: 'unit: kg' });
+});
+
+test('"None of these" without saying kg, items or bunches is not sent', async () => {
+  const a = app({ checked: { value: '', dataset: { unit: '', last: '' } } });
+  await a.run('fetchDeliveries()');
+  a.run("deliveryScreen('inv-1'); WHO='Rach'");
+  a.el('n2').value = '4';
+  a.run('saveCount(2)');
+  assert.equal(a.requests.filter(r => r.url.includes('/count')).length, 0);
+  assert.match(a.el('cm2').innerHTML, /kg, items or bunches/);
 });
 
 test('a count of zero or blank is never sent', async () => {

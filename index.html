@@ -182,7 +182,7 @@ function countRow(t) {
   const i = t.info || {}, a = t.answer || {};
   const head = `<b>${esc(i.description)}</b><div class="muted">Invoice: ${esc(i.qty ?? "")} × ${esc(i.unit || "")} at ${money(i.unit_price)}</div>`;
   if (t.status === "done") return `<div style="padding:10px 0;border-bottom:1px solid var(--line)">${head}<div class="note ok">${esc(a.name || "Matched")}: ${esc(a.count)} per box. Counted by ${esc(t.done_by)}.</div></div>`;
-  if (t.status === "escalated") return `<div style="padding:10px 0;border-bottom:1px solid var(--line)">${head}<div class="note">New product: ${esc(a.count)} per box, counted by ${esc(t.done_by)}. Josh will set it up. Don't put out a tag yet.</div></div>`;
+  if (t.status === "escalated") return `<div style="padding:10px 0;border-bottom:1px solid var(--line)">${head}<div class="note">New product: ${esc(a.count)} ${esc(unitWord(String(a.note || "").replace(/^unit:\s*/, "") || "each", Number(a.count)))} per box, counted by ${esc(t.done_by)}. Josh will set it up. Don't put out a tag yet.</div></div>`;
   if (t.status === "closed") return `<div style="padding:10px 0;border-bottom:1px solid var(--line)">${head}<div class="note ok">Sorted already — nothing to do.</div></div>`;
   const kg = String(i.description || "").match(/(\d+(?:\.\d+)?)\s*KG/i);
   const opts = (t.candidates || []).map(o => `<label style="display:block;padding:6px 0"><input type="radio" name="c${t.id}" value="${o.stock_item_id}" data-unit="${esc(o.count_unit)}" data-last="${o.last_count ?? ""}" style="width:auto" onchange="countUnit(${t.id})"> ${esc(o.name)}</label>`).join("");
@@ -196,7 +196,11 @@ function countRow(t) {
 }
 function countUnit(id) {
   const r = document.querySelector(`input[name="c${id}"]:checked`), u = document.getElementById("u" + id);
-  if (u) u.textContent = r && r.dataset.unit ? "(" + unitWord(r.dataset.unit, 2) + ")" : "";
+  if (!u) return;
+  if (r && !r.value) {
+    // new product: staff say what they counted, so "4" can't be read as 4 mushrooms when it was 4 kg
+    u.innerHTML = `<select id="us${id}" style="font-size:16px;padding:6px;border-radius:8px"><option value="">counted in…</option><option value="kg">kg (weighed)</option><option value="each">items</option><option value="bunch">bunches</option></select>`;
+  } else u.textContent = r && r.dataset.unit ? "(" + unitWord(r.dataset.unit, 2) + ")" : "";
 }
 async function searchItems(id) {
   const q = document.getElementById("q" + id).value, box = document.getElementById("cs" + id);
@@ -218,8 +222,14 @@ function saveCount(id) {
     return;
   }
   const item = r.value ? Number(r.value) : null;
+  let note;
+  if (!item) {
+    const us = document.getElementById("us" + id), unit = us ? us.value : "";
+    if (!unit) { m.innerHTML = `<div class="note err">Say what you counted: kg, items or bunches.</div>`; return; }
+    note = "unit: " + unit;
+  }
   pickName(async () => {
-    const res = await api(`/tasks/${id}/count`, { method: "POST", body: JSON.stringify({ stock_item_id: item, count: n, by: WHO }) });
+    const res = await api(`/tasks/${id}/count`, { method: "POST", body: JSON.stringify({ stock_item_id: item, count: n, by: WHO, ...(note ? { note } : {}) }) });
     await afterAction(res, item ? "Saved. Stock booked and price checked." : "Saved. Josh will set up the new product.");
   });
 }
