@@ -74,7 +74,7 @@ let idleT; function idle(){ clearTimeout(idleT); idleT = setTimeout(() => { if (
 async function homeScreen() {
   if (!KEY && !OWNER) return noKey();
   S = { dept: S.dept, supplier: null, photos: [], receipt: null }; WHO = null;
-  $(`<div id="own"></div><div id="dlv"></div><h2>New delivery</h2><p class="q">Which department is it for?</p>
+  $(`<div id="own"></div><div class="row" style="margin:0 0 18px"><button class="big" style="width:auto;padding:14px 22px" onclick="pricesScreen()">Shelf prices — look up a price</button></div><div id="dlv"></div><h2>New delivery</h2><p class="q">Which department is it for?</p>
   <div class="grid">${DEPTS.map(d=>`<button class="big" onclick="S.dept='${d}';supplierScreen()">${d}</button>`).join("")}</div>
   <h2 style="margin-top:28px">Recent deliveries</h2><p class="muted" style="margin:-8px 0 6px">Tap one to see its new products and print labels.</p><div class="list" id="recent"><span class="muted">Loading…</span></div>`);
   loadDeliveries();
@@ -82,6 +82,29 @@ async function homeScreen() {
   const items = (r.body && r.body.items) || [];
   document.getElementById("recent").innerHTML = items.map(x => `<div onclick="${x.status==='submitted'?`itemsScreen('${x.id}')`:''}" style="cursor:pointer"><span>${esc(x.supplier)} · ${esc(x.department)}</span><span class="muted">${esc(label(x))} · ${new Date(x.created_at).toLocaleDateString("en-AU",{day:"numeric",month:"short"})}</span></div>`).join("") || `<span class="muted">Nothing yet.</span>`;
   if (r.body && r.body.owner) document.getElementById("own").innerHTML = `<div class="row" style="margin:0 0 18px"><button class="secondary" onclick="needsScreen()">Josh: products waiting for a price</button></div>`;
+}
+
+// ---------- shelf prices (read-only, live from Square)
+let priceT;
+function pricesScreen() {
+  $(`<h2>Shelf prices</h2><p class="q">Tag missing or unreadable? Search here. Prices come straight from Square — what the register charges.</p>
+  <input id="pq" type="search" placeholder="e.g. strawberries" autocomplete="off" oninput="clearTimeout(priceT);priceT=setTimeout(priceSearch,400)">
+  <div id="pres" style="margin-top:14px"></div><div class="row"><button class="secondary" onclick="homeScreen()">Back</button></div>`);
+  setTimeout(() => { const i = document.getElementById("pq"); if (i && i.focus) i.focus(); }, 50);
+}
+function priceRows(rows) {
+  if (!rows.length) return `<p class="muted">Nothing in Square matches that. Try a shorter word.</p>`;
+  return `<div class="card"><table><thead><tr><th>Product</th><th>Section</th><th style="text-align:right">Price</th></tr></thead><tbody>${rows.map(r =>
+    `<tr><td>${esc(r.item)}${r.variation ? " — " + esc(r.variation) : ""}${r.sold_out ? ' <span class="muted">(sold out)</span>' : ""}</td><td class="muted">${esc(r.category || "")}</td>
+    <td style="text-align:right;white-space:nowrap">${r.price == null ? '<span class="muted">Price at register — check with Josh</span>' : `<b>${money(r.price)}</b> ${r.per && r.per !== "each" ? "/ " + esc(r.per) : "each"}`}</td></tr>`).join("")}</tbody></table></div>`;
+}
+async function priceSearch() {
+  const q = (document.getElementById("pq").value || "").trim(), out = document.getElementById("pres");
+  if (q.length < 2) { out.innerHTML = ""; return; }
+  out.innerHTML = `<div class="spinner"></div>`;
+  const r = await api("/prices?q=" + encodeURIComponent(q));
+  if (document.getElementById("pq").value.trim() !== q) return;
+  out.innerHTML = r.ok && r.body.ok ? priceRows(r.body.rows || []) : `<div class="note err">${esc((r.body && r.body.error) || "Couldn't reach Square. Try again in a minute.")}</div>`;
 }
 
 // ---------- a delivery's products (labels)
