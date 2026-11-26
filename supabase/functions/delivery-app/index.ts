@@ -15,15 +15,20 @@
 // v15 (26 Nov 2026): config-read failures fail closed as 503 (never cached, never reported as an invalid device);
 //   wrong/malformed keys stay 401 (auth.ts, tested in repo). Routes now surface DB errors instead of returning empty
 //   success. GET /health reports BUILD and SOURCE_SHA (embedded by scripts/check-edge.mjs) for deploy verification.
+// v17 (26 Nov 2026): photo receipts are reserved before upload with a payload fingerprint, never overwrite stored photos,
+//   check every storage/row write, and re-dispatch a lost or failed reader hand-off from the stored PDF (receipts.ts).
+//   Shelf-tag confirm uses delivery_tag_claim then delivery_tag_apply as two calls when the database has them
+//   (staged pricing_03); before that it falls back to the single delivery_task_tick call.
 // v16 (26 Nov 2026): POST /receipts accepts a client op_id (uuid) and uses it as the receipt id, so re-sending the same
 //   photo set after an uncertain failure returns the existing receipt instead of creating a duplicate delivery.
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import { PDFDocument } from "npm:pdf-lib@1.17.1";
 import { ConfigUnavailable, makeCfg, whoFromHeaders } from "./auth.ts";
+import { createReceipt, reconcileReceipt, type Deps, type Receipt } from "./receipts.ts";
 
-export const BUILD = "delivery-app v16 2026-11-26";
-// SOURCE_SHA is written by scripts/check-edge.mjs --write: sha-256 of index.ts (with this one line removed) and auth.ts.
-export const SOURCE_SHA = { index: "f08157cb25c1d77ee0dd474714fccd02c3c1bc7e15d99fc3e30e400a6dc8c9d2", auth: "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331" };
+export const BUILD = "delivery-app v17 2026-11-26";
+// SOURCE_SHA is written by scripts/check-edge.mjs --write: sha-256 of index.ts (with this one line removed), auth.ts and receipts.ts.
+export const SOURCE_SHA = { index: "e2aa9d0adfe57e33434ce7631778c9db915ea3771370f68d897cd788d34bec44", auth: "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331", receipts: "e126d02d17e6b52743fbd022f847cf14270b47a437bcbddb7347f245814dec1f" };
 
 const URL_ = Deno.env.get("SUPABASE_URL")!;
 const SB = createClient(URL_, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
@@ -44,8 +49,52 @@ const cfg = makeCfg(async (key) => {
 const who = (req: Request) => whoFromHeaders(req.headers, cfg);
 const unavailable = () => json({ error: "The app can't reach its settings right now. Wait a moment and try again.", retry: true }, 503);
 
-function b64ToBytes(b64: string) { const s = atob(b64.replace(/^data:[^,]+,/, "")); const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; }
 function bytesToB64(u: Uint8Array) { let s = ""; for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode(...u.subarray(i, i + 0x8000)); return btoa(s); }
+const RCOLS = "id, source_id, supplier, department, status, photo_paths, confirmed_payload, hold_reason, created_at";
+const hex = (b: ArrayBuffer) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
+const DEPS: Deps = {
+  getReceipt: async (id) => { const r = await SB.from("delivery_receipts").select(RCOLS).eq("id", id).maybeSingle(); return { data: r.data as Receipt | null, error: r.error }; },
+  insertReceipt: async (row) => { const r = await SB.from("delivery_receipts").insert(row); return { error: r.error }; },
+  updateReceipt: async (id, patch, cond) => {
+    let q = SB.from("delivery_receipts").update(patch).eq("id", id).in("status", cond.statuses);
+    if ("lastDispatchAt" in cond) {
+      q = cond.lastDispatchAt == null ? q.is("confirmed_payload->upload->>last_dispatch_at", null) : q.eq("confirmed_payload->upload->>last_dispatch_at", cond.lastDispatchAt);
+    }
+    const r = await q.select(RCOLS);
+    return { data: r.data as Receipt[] | null, error: r.error };
+  },
+  upload: async (path, bytes, contentType) => {
+    const r = await SB.storage.from("delivery-photos").upload(path, bytes, { contentType, upsert: false });
+    if (!r.error) return { error: null };
+    const e = r.error as { message: string; statusCode?: string | number };
+    return { error: { message: e.message }, exists: String(e.statusCode ?? "") === "409" || /already exists|duplicate/i.test(e.message) };
+  },
+  download: async (path) => {
+    const r = await SB.storage.from("delivery-photos").download(path);
+    return { data: r.data ? new Uint8Array(await r.data.arrayBuffer()) : null, error: r.error ? { message: r.error.message } : null };
+  },
+  queueRow: async (sourceId) => { const r = await SB.from("invoice_ingest_queue").select("source_id").eq("source_id", sourceId).maybeSingle(); return { data: r.data, error: r.error }; },
+  buildPdf: async (pages) => {
+    const pdf = await PDFDocument.create();
+    for (const bytes of pages) {
+      const img = await pdf.embedJpg(bytes);
+      const page = pdf.addPage([img.width, img.height]);
+      page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
+    }
+    return await pdf.save();
+  },
+  dispatch: async ({ source_id, supplier, department, pdf }) => {
+    const r = await fetch(`${URL_}/functions/v1/invoice-reader`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-poppies-key": HOOK_KEY },
+      body: JSON.stringify({ drive_file_id: source_id, supplier_folder: supplier, business_unit_folder: department, file_name: "New stock app photo", pdf_base64: bytesToB64(pdf), received_at: new Date().toISOString() }),
+    });
+    return { ok: r.ok, status: r.status, body: await r.json().catch(() => ({})) };
+  },
+  now: () => new Date(),
+  sha256: async (d) => hex(await crypto.subtle.digest("SHA-256", typeof d === "string" ? new TextEncoder().encode(d) : new Uint8Array(d))),
+  uuid: () => crypto.randomUUID(),
+};
 function setup(body: unknown) {
   return fetch(`${URL_}/functions/v1/new-stock-setup`, { method: "POST", headers: { "content-type": "application/json", "x-poppies-key": HOOK_KEY }, body: JSON.stringify(body) });
 }
@@ -123,6 +172,20 @@ Deno.serve(async (req) => {
         if (!(price > 0 && price < 10000)) return json({ error: "Enter a price above 0." }, 400);
         const r = await setup({ line_id: Number(b.line_id), josh_price: Math.round(price * 100) / 100 });
         return json(await r.json().catch(() => ({})), r.status);
+      }
+      const pm = path.match(/^\/owner\/price-ops\/(\d+)\/resolve$/);
+      if (req.method === "POST" && pm) {
+        // Josh settles a register price the tag confirm could not apply safely (changed elsewhere, or a smaller tag with
+        // no recorded price): 'overwrite' with the price the register shows now, or 'skip' to leave the register as is.
+        const b = await req.json().catch(() => ({}));
+        const action = b.action === "overwrite" || b.action === "skip" ? b.action : null;
+        const now = Number(b.register_now);
+        if (!action) return json({ error: "Unknown action." }, 400);
+        if (action === "overwrite" && !(Number.isFinite(now) && now >= 0 && now < 10000)) return json({ error: "Enter the price the register shows now." }, 400);
+        const { data, error } = await SB.rpc("price_op_resolve", { p_op_id: Number(pm[1]), p_action: action,
+          p_expected_cents: action === "overwrite" ? Math.round(now * 100) : null, p_by: "Josh" });
+        if (error) return json({ error: error.code === "PGRST202" ? "Not available yet." : "Couldn't save. Try again." }, error.code === "PGRST202" ? 404 : 500);
+        return json(data, data?.ok ? 200 : 400);
       }
       const om = path.match(/^\/owner\/tasks\/(\d+)\/decide$/);
       if (req.method === "POST" && om) {
@@ -202,6 +265,21 @@ Deno.serve(async (req) => {
         const by = String(b.by ?? "").trim().slice(0, 40);
         const names = (await cfg("delivery_staff_names")).split(",").map((n) => n.trim());
         if (!names.includes(by)) return json({ error: "Pick your name first." }, 400);
+        if (tm[2] === "tick") {
+          // two transactions: the claim (with its audit + operation keys) commits before any register write
+          const c = await SB.rpc("delivery_tag_claim", { p_task_id: id, p_by: by });
+          if (c.error) {
+            // database without pricing_03 (no claim function), or the claim call failed: the single-call form is safe in
+            // both cases (before 03 it is today's tick; after 03 it is claim + apply in one transaction with the same keys)
+            const { data, error } = await SB.rpc("delivery_task_tick", { p_task_id: id, p_by: by });
+            if (error) return json({ error: error.message }, 500);
+            return json(data, data?.ok ? 200 : 400);
+          }
+          if (c.data?.phase !== "apply") return json(c.data, c.data?.ok ? 200 : 400);
+          const a = await SB.rpc("delivery_tag_apply", { p_task_id: id, p_token: c.data.token, p_by: by });
+          if (a.error) return json({ error: "The register update didn't finish. Wait two minutes, then tap again — it won't be changed twice.", status: "busy" }, 502);
+          return json(a.data, a.data?.ok ? 200 : 400);
+        }
         const { data, error } = tm[2] === "tick"
           ? await SB.rpc("delivery_task_tick", { p_task_id: id, p_by: by })
           : await SB.rpc("delivery_count_answer", {
@@ -222,54 +300,10 @@ Deno.serve(async (req) => {
     }
 
     if (req.method === "POST" && path === "/receipts") {
-      const b = await req.json();
-      const supplier = String(b.supplier ?? "").trim();
-      const department = String(b.department ?? "");
-      const images: string[] = Array.isArray(b.images) ? b.images : [];
-      if (!supplier || !DEPTS.includes(department) || !images.length || images.length > 6) return json({ error: "supplier, department and 1 to 6 photos are needed" }, 400);
-      const opId = typeof b.op_id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(b.op_id) ? b.op_id : null;
-      if (opId) {
-        const { data: prior, error: priorErr } = await SB.from("delivery_receipts").select("id, status, supplier, department").eq("id", opId).maybeSingle();
-        if (priorErr) return json({ error: "Couldn't check for an earlier send. Try again." }, 500);
-        if (prior) {
-          if (prior.supplier !== supplier || prior.department !== department) return json({ error: "This upload id belongs to a different delivery." }, 409);
-          return json({ id: prior.id, status: prior.status, already_received: true }, 200);
-        }
-      }
-      const id = opId ?? crypto.randomUUID();
-      const source_id = `app:${id}`;
-      const pdf = await PDFDocument.create();
-      const paths: string[] = [];
-      for (let i = 0; i < images.length; i++) {
-        const bytes = b64ToBytes(images[i]);
-        const p = `${new Date().toISOString().slice(0, 10)}/${id}/page-${i + 1}.jpg`;
-        const up = await SB.storage.from("delivery-photos").upload(p, bytes, { contentType: "image/jpeg", upsert: true });
-        if (up.error) throw new Error(`photo upload: ${up.error.message}`);
-        paths.push(p);
-        const img = await pdf.embedJpg(bytes);
-        const page = pdf.addPage([img.width, img.height]);
-        page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
-      }
-      const pdfBytes = await pdf.save();
-      await SB.storage.from("delivery-photos").upload(`${paths[0].split("/").slice(0, 2).join("/")}/invoice.pdf`, pdfBytes, { contentType: "application/pdf", upsert: true });
-      const ins = await SB.from("delivery_receipts").insert({ id, source_id, supplier, department, photo_paths: paths, status: "reading" });
-      if (ins.error) {
-        // a concurrent send with the same op_id won the insert: return that receipt rather than a duplicate
-        const { data: won } = await SB.from("delivery_receipts").select("id, status").eq("id", id).maybeSingle();
-        if (won) return json({ id: won.id, status: won.status, already_received: true }, 200);
-        return json({ error: "Couldn't save the delivery. Try again." }, 500);
-      }
-      const r = await fetch(`${URL_}/functions/v1/invoice-reader`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-poppies-key": HOOK_KEY },
-        body: JSON.stringify({ drive_file_id: source_id, supplier_folder: supplier, business_unit_folder: department, file_name: "New stock app photo", pdf_base64: bytesToB64(pdfBytes), received_at: new Date().toISOString() }),
-      });
-      const rb = await r.json().catch(() => ({}));
-      if (!r.ok || rb.status !== "accepted") {
-        await SB.from("delivery_receipts").update({ status: "error", hold_reason: `reader: ${r.status} ${JSON.stringify(rb).slice(0, 200)}` }).eq("id", id);
-        return json({ id, status: "error", reason: "The invoice reader is not available right now. The photo is saved." }, 502);
-      }
-      return json({ id, status: "reading" }, 202);
+      const b = await req.json().catch(() => null);
+      if (!b || typeof b !== "object") return json({ error: "supplier, department and 1 to 6 photos are needed" }, 400);
+      const out = await createReceipt(DEPS, b as Record<string, unknown>);
+      return json(out.body, out.status);
     }
 
     const m = path.match(/^\/receipts\/([0-9a-f-]{36})(\/submit|\/cancel|\/items)?$/);
@@ -288,7 +322,11 @@ Deno.serve(async (req) => {
           } else if (q && ["error", "skipped_not_stock"].includes(q.status)) {
             await SB.from("delivery_receipts").update({ status: "error", hold_reason: q.hold_reason }).eq("id", rec.id);
             rec.status = "error"; rec.hold_reason = q.hold_reason;
+          } else if (!q) {
+            Object.assign(rec, await reconcileReceipt(DEPS, rec as Receipt));   // lost reader hand-off: re-send the stored PDF
           }
+        } else if (rec.status === "error") {
+          Object.assign(rec, await reconcileReceipt(DEPS, rec as Receipt));     // failed reader hand-off: retry from the stored PDF
         }
         return json({ id: rec.id, status: rec.status, supplier: rec.supplier, department: rec.department, extraction: rec.extraction, setup_status: rec.setup_status, hold_reason: rec.hold_reason });
       }

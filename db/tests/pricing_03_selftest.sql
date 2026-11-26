@@ -14,9 +14,9 @@ insert into processed_invoices (source_id, supplier, invoice_number, invoice_dat
   ('inv-1', 'Supplier P', 'P-1', '2026-11-20', 'INVOICE', 1, 'Grocer'),
   ('inv-2', 'Supplier P', 'P-2', '2026-11-22', 'INVOICE', 1, 'Grocer'),
   ('inv-0', 'Supplier P', 'P-0', '2026-11-10', 'INVOICE', 1, 'Grocer');   -- booked last, dated first
-insert into stock_items (id, name, department, retail_sell_price, count_unit) select 100 + g, 'Synthetic produce ' || g, 'Grocer', 5.00, 'kg' from generate_series(0, 24) g;
-insert into square_sync_map (stock_item_id, square_variation_id, retail_category) select 100 + g, pg_temp.v(100 + g), 'Produce' from generate_series(0, 24) g;
-select pg_temp.mx('insert into square (variation_id, cents) select ''VARSYNTH'' || lpad(g::text, 16, ''0''), 500 from generate_series(0, 24) g');
+insert into stock_items (id, name, department, retail_sell_price, count_unit) select 100 + g, 'Synthetic produce ' || g, 'Grocer', 5.00, 'kg' from generate_series(0, 29) g;
+insert into square_sync_map (stock_item_id, square_variation_id, retail_category) select 100 + g, pg_temp.v(100 + g), 'Produce' from generate_series(0, 29) g;
+select pg_temp.mx('insert into square (variation_id, cents) select ''VARSYNTH'' || lpad(g::text, 16, ''0''), 500 from generate_series(0, 29) g');
 -- halves: item 100/101/102 have recorded half prices; item 110's half has never had a recorded price
 insert into square_variation_identity values ('VARHALF100XXXXXXXXXXXX', 'Synthetic produce 0', 'Half'), ('VARHALF101XXXXXXXXXXXX', 'Synthetic produce 1', 'Half'),
   ('VARHALF102XXXXXXXXXXXX', 'Synthetic produce 2', 'Half'), ('VARHALF110XXXXXXXXXXXX', 'Synthetic produce 10', 'Half');
@@ -197,9 +197,51 @@ select pg_temp.ok((pg_temp.confirm((select id from delivery_tasks where source_i
 select pg_temp.cand(121, 9.90, true); select produce_price_items('inv-1', array[121::bigint], false);
 select pg_temp.ok((select status = 'open' from delivery_tasks where source_id = 'old-121'), 'B5 a held owner price leaves the current reminder open');
 select pg_temp.ok(pg_temp.mq(pg_temp.v(120), 'puts') = 0 and pg_temp.mq(pg_temp.v(121), 'puts') = 0, 'B5 no register writes from tag-only jobs');
+-- B6 unknown-price half: owner 'skip' closes it without inventing a price; job completes
+insert into square_variation_identity values ('VARHALF122XXXXXXXXXXXX', 'Synthetic produce 22', 'Half'), ('VARHALF123XXXXXXXXXXXX', 'Synthetic produce 23', 'Half'),
+  ('VARHALF124XXXXXXXXXXXX', 'Synthetic produce 24', 'Half'), ('VARHALF125XXXXXXXXXXXX', 'Synthetic produce 25', 'Half');
+insert into test_part_prices values (122, 'VARHALF122XXXXXXXXXXXX', 2.70), (123, 'VARHALF123XXXXXXXXXXXX', 2.70), (124, 'VARHALF124XXXXXXXXXXXX', 2.70), (125, 'VARHALF125XXXXXXXXXXXX', 2.70);
+select pg_temp.mx('insert into square (variation_id, cents) values (''VARHALF122XXXXXXXXXXXX'', 300), (''VARHALF123XXXXXXXXXXXX'', 300), (''VARHALF124XXXXXXXXXXXX'', 300), (''VARHALF125XXXXXXXXXXXX'', 300)');
+select pg_temp.cand(122, 5.40); select produce_price_items('inv-1', array[122::bigint], false);
+select pg_temp.confirm(pg_temp.task(122));
+select pg_temp.ok((price_op_resolve((select id from price_apply_op where task_id = pg_temp.task(122) and role = 'part'), 'skip', null, 'Josh')->'task'->>'status') = 'done',
+                  'B6 owner skip of an unknown-price half completes the job');
+select pg_temp.ok((select state = 'skipped' and expected_cents is null from price_apply_op where task_id = pg_temp.task(122) and role = 'part')
+                  and pg_temp.mq('VARHALF122XXXXXXXXXXXX', 'puts') = 0, 'B6 half left as is, no price invented');
+-- B7 unknown-price half superseded by a newer price (blocked -> superseded is allowed)
+select pg_temp.cand(123, 5.40); select produce_price_items('inv-1', array[123::bigint], false);
+create temp table b7 as select pg_temp.task(123) id;
+select pg_temp.cand(123, 5.60); select produce_price_items('inv-2', array[123::bigint], false);
+select pg_temp.ok((select state = 'superseded' from price_apply_op where task_id = (select id from b7) and role = 'part'), 'B7 blocked half superseded by a newer price');
+-- B7b owner Keep on a newer held price also closes an older authorised job with a blocked half
+select pg_temp.cand(124, 5.40); select produce_price_items('inv-1', array[124::bigint], false);
+create temp table b7b as select pg_temp.task(124) id;
+select pg_temp.cand(124, 9.90, true); select pg_temp.deliver('inv-2', array[124]);
+select delivery_price_decide((select id from delivery_tasks where kind = 'hold' and stock_item_id = 124 and status = 'open'), 'keep', null, 'Josh');
+select pg_temp.ok((select state = 'superseded' from price_apply_op where task_id = (select id from b7b) and role = 'part'), 'B7 newer held price + Keep close the blocked half');
+-- B8 a delivery card reused by a newer revision: the job only ever reads its CURRENT proposal's operations
+select price_propose(jsonb_build_object('mode', 'authorised', 'item', 125, 'variation', pg_temp.v(125), 'old', 5.00, 'new', 5.40, 'source', 'rev:1',
+       'task_source', 'card-125', 'basis_date', '2026-11-21', 'label', jsonb_build_object('name', 'Synthetic produce 25', 'per', 'per kg')));
+create temp table b8 as select id, proposal_id from delivery_tasks where source_id = 'card-125';
+select price_propose(jsonb_build_object('mode', 'authorised', 'item', 125, 'variation', pg_temp.v(125), 'old', 5.00, 'new', 5.60, 'source', 'rev:2',
+       'task_source', 'card-125', 'basis_date', '2026-11-22', 'label', jsonb_build_object('name', 'Synthetic produce 25', 'per', 'per kg')));
+select pg_temp.ok((select id = (select id from b8) and proposal_id <> (select proposal_id from b8) and status = 'open' from delivery_tasks where source_id = 'card-125'),
+                  'B8 same card reused with the newer proposal');
+select pg_temp.ok((select count(*) = 4 from price_apply_op where task_id = (select id from b8)), 'B8 older revision operations kept as history');
+select pg_temp.ok((select jsonb_array_length(t->'parts') = 1 and (t->'main'->>'new')::numeric = 5.60
+                     from jsonb_array_elements(delivery_tasks_list()) c, jsonb_array_elements(c->'tasks') t where (t->>'id')::bigint = (select id from b8)),
+                  'B8 list shows only the current revision');
+select pg_temp.confirm((select id from b8));
+select price_op_resolve((select id from price_apply_op where task_id = (select id from b8) and role = 'part' and state = 'blocked'), 'skip', null, 'Josh');
+select pg_temp.ok((select status = 'done' from delivery_tasks where id = (select id from b8)) and pg_temp.mq(pg_temp.v(125), 'cents') = 560,
+                  'B8 job completes on the current revision (old superseded operations do not hold it open)');
+-- leave one authorised job with a blocked half open, for the rollback check
+select pg_temp.cand(126, 5.40); insert into square_variation_identity values ('VARHALF126XXXXXXXXXXXX', 'Synthetic produce 26', 'Half');
+insert into test_part_prices values (126, 'VARHALF126XXXXXXXXXXXX', 2.70); select produce_price_items('inv-1', array[126::bigint], false);
+select pg_temp.ok(delivery_tasks_list()::text !~ 'VARHALF', 'T13 no half/quarter Square ids anywhere in the staff list');
 -- T13 staff list: price fields and named half/quarter rows, no Square ids in what staff see
 select pg_temp.ok((select delivery_tasks_list()::text like '%"price_mode": "apply_on_confirm"%'), 'T13 list shows price mode');
-select pg_temp.ok((select bool_and(p->>'name' is not null and p->>'old' is not null and p->>'new' is not null and not (p ? 'variation'))
+select pg_temp.ok((select bool_and(p->>'name' is not null and (p->>'old' is not null or p->>'state' in ('blocked', 'skipped', 'superseded')) and p->>'new' is not null and not (p ? 'variation'))
                      from jsonb_array_elements(delivery_tasks_list()) c, jsonb_array_elements(c->'tasks') t, jsonb_array_elements(case when jsonb_typeof(t->'parts') = 'array' then t->'parts' else '[]' end) p), 'T13 parts named, priced, no ids');
 select pg_temp.ok(not exists (select 1 from jsonb_array_elements(delivery_tasks_list()) c, jsonb_array_elements(c->'tasks') t where t->'info' ? 'parts'), 'T13 no raw parts in info');
 select pg_temp.ok(pg_temp.mq('VARHALF101XXXXXXXXXXXX', 'puts') = 0, 'no unexpected write to a conflicting half');

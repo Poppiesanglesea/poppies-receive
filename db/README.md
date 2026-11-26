@@ -25,7 +25,11 @@ pricing-maths view are explicit fixtures), applies 01 / 02 / 03 as single transa
 - `tests/pricing_03_concurrency.sh`: three sessions (slow confirm holding the item lock, newer invoice touching two items
   in reverse order, confirm on the other item): no deadlock, one write, correct supersede order;
 - 03 rollback guard and evidence-preserving rollback (`tests/pricing_03_rollback_checks.sql`).
-Last run (26 Nov 2026): provenance_02 8/8 + 4 rollback checks; pricing_03 67/67; concurrency 6/6; 03 rollback 2 + 8/8.
+Last run (26 Nov 2026, rev 2b): provenance_02 8/8 + 4 rollback checks; pricing_03 76/76; concurrency 6/6; 03 rollback 2 + 9/9.
+Rev 2b (after review of 49f251a): unknown-price halves can close as skipped/superseded without inventing a price
+(owner skip, newer price, Keep, rollback all tested); every job reads only its CURRENT proposal's operations when a
+delivery card is reused by a newer revision (tested); owner resolution is wired end to end — Edge
+`POST /owner/price-ops/:id/resolve` and a "Register prices to check" section on Josh's screen (active once 03 is applied).
 
 ## Pending approvals (each needs a specific yes; the Supabase prompt shows potentially destructive SQL)
 1. `provenance_02_schema` (rev 2): adds 4 derived key columns to processed_invoices and fills them; new trigger;

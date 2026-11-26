@@ -11,13 +11,14 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const dir = new URL('../supabase/functions/delivery-app/', import.meta.url);
-const FILES = ['index.ts', 'auth.ts'];
+const FILES = ['index.ts', 'auth.ts', 'receipts.ts'];
 const REQUIRED = {
   'index.ts': ['Deno.serve(', 'from "./auth.ts"', 'export const BUILD = "', 'export const SOURCE_SHA = {', '"/health"', '"/deliveries"',
-               '"/recent-deliveries"', '"/prices/all"', '"/recent"', '"/suppliers"', '"/receipts"', 'op_id', 'ConfigUnavailable', 'whoFromHeaders'],
+               '"/recent-deliveries"', '"/prices/all"', '"/recent"', '"/suppliers"', '"/receipts"', 'op_id', 'ConfigUnavailable', 'whoFromHeaders', 'from "./receipts.ts"', 'delivery_tag_claim', 'delivery_tag_apply', 'price_op_resolve'],
   'auth.ts': ['export class ConfigUnavailable', 'export function makeCfg', 'export async function whoFromHeaders'],
+  'receipts.ts': ['export async function createReceipt', 'export async function reconcileReceipt', 'status: "uploading"', 'upload_failed'],
 };
-const MIN_BYTES = { 'index.ts': 15000, 'auth.ts': 1500 };
+const MIN_BYTES = { 'index.ts': 15000, 'auth.ts': 1500, 'receipts.ts': 5000 };
 const SHA_LINE = /^export const SOURCE_SHA = \{[^\n]*\};\n/m;
 const sha = (t) => createHash('sha256').update(t).digest('hex');
 const path = (f) => fileURLToPath(new URL(f, dir));
@@ -29,8 +30,8 @@ const shaIndex = (text) => sha(text.replace(SHA_LINE, ''));
 if (args[0] === '--write') {
   let idx = read('index.ts');
   if (!SHA_LINE.test(idx)) { console.error('index.ts has no SOURCE_SHA line'); process.exit(1); }
-  const want = { index: shaIndex(idx), auth: sha(read('auth.ts')) };
-  idx = idx.replace(SHA_LINE, `export const SOURCE_SHA = { index: "${want.index}", auth: "${want.auth}" };\n`);
+  const want = { index: shaIndex(idx), auth: sha(read('auth.ts')), receipts: sha(read('receipts.ts')) };
+  idx = idx.replace(SHA_LINE, `export const SOURCE_SHA = { index: "${want.index}", auth: "${want.auth}", receipts: "${want.receipts}" };\n`);
   writeFileSync(path('index.ts'), idx);
 }
 
@@ -41,10 +42,10 @@ for (const f of FILES) {
   for (const needle of REQUIRED[f]) if (!texts[f].includes(needle)) errors.push(`${f}: missing ${needle}`);
 }
 const build = ((texts['index.ts'] || '').match(/export const BUILD = "([^"]+)"/) || [])[1];
-const actual = { index: shaIndex(texts['index.ts'] || ''), auth: sha(texts['auth.ts'] || '') };
-const m = (texts['index.ts'] || '').match(/export const SOURCE_SHA = \{ index: "([0-9a-f]*)", auth: "([0-9a-f]*)" \};/);
-const embedded = m ? { index: m[1], auth: m[2] } : null;
-if (!embedded || embedded.index !== actual.index || embedded.auth !== actual.auth) errors.push('embedded SOURCE_SHA is stale (run --write after a deliberate change)');
+const actual = { index: shaIndex(texts['index.ts'] || ''), auth: sha(texts['auth.ts'] || ''), receipts: sha(texts['receipts.ts'] || '') };
+const m = (texts['index.ts'] || '').match(/export const SOURCE_SHA = \{ index: "([0-9a-f]*)", auth: "([0-9a-f]*)", receipts: "([0-9a-f]*)" \};/);
+const embedded = m ? { index: m[1], auth: m[2], receipts: m[3] } : null;
+if (!embedded || embedded.index !== actual.index || embedded.auth !== actual.auth || embedded.receipts !== actual.receipts) errors.push('embedded SOURCE_SHA is stale (run --write after a deliberate change)');
 const fileSha = Object.fromEntries(FILES.map((f) => [f, sha(texts[f] || '')]));
 
 const manifestPath = path('MANIFEST.json');
@@ -60,7 +61,7 @@ if (args[0] === '--live') {
   try { live = JSON.parse(args[1]); } catch { errors.push('--live needs the JSON body of GET /health'); }
   if (live) {
     if (live.build !== build) errors.push(`live build "${live.build}" != source "${build}"`);
-    if (live.source_sha?.index !== actual.index || live.source_sha?.auth !== actual.auth) errors.push('live SOURCE_SHA does not match this source');
+    if (live.source_sha?.index !== actual.index || live.source_sha?.auth !== actual.auth || live.source_sha?.receipts !== actual.receipts) errors.push('live SOURCE_SHA does not match this source');
   }
 }
 console.log(JSON.stringify({ build, source_sha: actual, file_sha256: fileSha, ok: !errors.length, errors }, null, 2));

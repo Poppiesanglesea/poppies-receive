@@ -9,3 +9,4 @@ select pg_temp.ok(pg_get_functiondef('public.delivery_task_tick(bigint,text)'::r
 select pg_temp.ok(not exists (select 1 from delivery_tasks where price_mode = 'apply_on_confirm' and status = 'open'), '03 rollback leaves no open apply-on-confirm job');
 select pg_temp.ok(not exists (select 1 from retail_price_proposal where status = 'authorised'), '03 rollback leaves no authorised proposal');
 select pg_temp.ok((select count(*) from retail_price_proposal where status = 'applied') = (select n from applied_before), '03 rollback keeps applied history');
+select pg_temp.ok(not exists (select 1 from price_apply_op where state in ('ready', 'blocked', 'failed', 'conflict')), '03 rollback closes open operations (incl. unknown-price halves) without inventing prices');

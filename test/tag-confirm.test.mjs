@@ -85,3 +85,20 @@ test('superseded tag-only reminder no longer asks staff to change the label; kep
     assert.match(el('app').innerHTML, re); assert.doesNotMatch(el('app').innerHTML, /onclick="tickTag/);
   }
 });
+
+test('Josh sees conflicting / unknown register prices and can resolve them (posts the register price he saw)', async () => {
+  const t = tag({ price_mode: 'apply_on_confirm', apply_state: 'partial', main: { op: 41, state: 'applied', old: 5, new: 5.4 },
+    parts: [{ op: 42, name: 'Pumpkin – Half', per: 'per kg', old: 2.5, new: 2.7, state: 'conflict', register_now: 2.6 },
+            { op: 43, name: 'Pumpkin – Quarter', per: 'per kg', old: null, new: 1.4, state: 'blocked', register_now: null }] });
+  const { ctx, el, reqs } = app([t]);
+  await settle(); vm.runInContext('DLV.owner = true', ctx);
+  await vm.runInContext('joshScreen()', ctx);
+  const h = el('app').innerHTML;
+  assert.match(h, /Register prices to check/); assert.match(h, /Pumpkin – Half/); assert.match(h, /register showed \$2\.60/i);
+  assert.match(h, /No price has been recorded/); assert.match(h, /resolveOp\(42,'overwrite'\)/); assert.match(h, /resolveOp\(43,'skip'\)/);
+  assert.doesNotMatch(h, /resolveOp\(41/);
+  el('rn42').value = '2.60';
+  await vm.runInContext("resolveOp(42, 'overwrite')", ctx); await settle();
+  const r = reqs.find(x => x.path === '/owner/price-ops/42/resolve');
+  assert.ok(r, 'resolve request sent'); assert.equal(r.method, 'POST');
+});

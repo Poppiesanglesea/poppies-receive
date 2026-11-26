@@ -236,7 +236,7 @@ async function toggleMonth(m) {
 
 function label(x){
   if (x.status === "submitted") return ({pending:"being set up", ready:"in Square — print labels", awaiting_price:"in Square — some waiting for a price", needs_josh:"waiting on Josh", failed:"problem — Josh notified", dry_run:"test run only (not in Square)", empty:"nothing new to set up"})[x.setup_status] || "sent";
-  return ({reading:"being read", ready:"waiting for a check", error:"problem"})[x.status] || x.status;
+  return ({uploading:"being saved", upload_failed:"not saved — send the photos again", reading:"being read", ready:"waiting for a check", error:"problem"})[x.status] || x.status;
 }
 
 // ---------- Deliveries: jobs from booked invoices (tags to change, boxes to count, Josh's price decisions)
@@ -400,6 +400,30 @@ async function decide(id, decision, price) {
   const isBox = DLV.cards.some(c => (c.tasks || []).some(t => t.id === id && t.kind === "boxsize"));
   await afterAction(res, decision === "keep" ? "Kept as it was." : isBox ? "New usual box size saved for future deliveries." : (res.body && res.body.register === "on tag confirm" ? "Price approved. Staff will see a tag to change; the register updates when they confirm it." : "Price changed in Square. Staff will see a tag to change."));
 }
+// Josh: register prices the tag confirm stopped on (main price changed elsewhere; smaller tag conflicting or unknown).
+function opsToCheck(t) {
+  const m = t.main && t.main.state === "conflict" ? [{ ...t.main, name: (t.info || {}).name, per: (t.info || {}).per, main: true }] : [];
+  const p = (Array.isArray(t.parts) ? t.parts : []).filter(x => x.state === "conflict" || x.state === "blocked");
+  return [...m, ...p].filter(o => o.op != null);
+}
+function opRow(t, o) {
+  const why = o.state === "blocked" ? "No price has been recorded for this tag, so the app can't tell what the register shows."
+    : `The register showed ${o.register_now == null ? "a different price" : money(o.register_now)}, not ${money(o.old)}.`;
+  return `<div style="padding:10px 0"><b>${esc(o.name || "Tag")}</b> → ${money(o.new)} ${esc(o.per || "")}<div class="muted">${why}</div>
+    <div class="row" style="margin-top:6px"><label class="muted" style="align-self:center">Register shows $</label>
+    <input id="rn${o.op}" inputmode="decimal" value="${o.register_now == null ? "" : Number(o.register_now).toFixed(2)}" style="max-width:110px">
+    <button class="primary small" onclick="resolveOp(${o.op},'overwrite')">Update to ${money(o.new)}</button>
+    <button class="secondary small" onclick="resolveOp(${o.op},'skip')">Leave register as is</button></div></div>`;
+}
+async function resolveOp(op, action) {
+  const el = document.getElementById("rn" + op);
+  const now = el ? Number(String(el.value).replace(/[^0-9.]/g, "")) : NaN;
+  if (action === "overwrite" && !(el && el.value.trim() !== "" && Number.isFinite(now))) {
+    return afterAction({ ok: false, body: { error: "Enter the price the register shows now." } }, null);
+  }
+  const res = await api(`/owner/price-ops/${op}/resolve`, { method: "POST", body: JSON.stringify({ action, register_now: action === "overwrite" ? now : null }) });
+  await afterAction(res, action === "skip" ? "Left as it is." : "Saved. Staff will see the tag button again; the register updates when they confirm.");
+}
 // One shelf-tag job: the main tag row, then one row per half/quarter tag in the same group (names and prices only).
 const PART_STATE = { applied: "✓ register updated", skipped: "left as is", blocked: "Josh to check", conflict: "Josh to check",
   failed: "not updated yet", ambiguous: "not updated yet", applying: "updating…", superseded: "replaced" };
@@ -465,8 +489,10 @@ async function joshScreen(msg) {
   const rows = DLV.cards.flatMap(c => jobs(c, ["hold", "noprice"]).filter(t => t.status === "open").map(t => ({ c, t })));
   const boxq = DLV.cards.flatMap(c => jobs(c, ["boxsize"]).filter(t => t.status === "open").map(t => ({ c, t })));
   const news = DLV.cards.flatMap(c => jobs(c, ["count"]).filter(t => t.status === "escalated").map(t => ({ c, t })));
+  const regs = DLV.cards.flatMap(c => jobs(c, ["tag"]).filter(t => t.status === "open" && t.price_mode === "apply_on_confirm").flatMap(t => opsToCheck(t).map(o => ({ c, t, o }))));
   $(`<h2>Price decisions</h2>${msg ? `<div class="note ${msg.ok ? "ok" : "err"}">${esc(msg.text)}</div>` : ""}
    ${rows.length ? rows.map(({ c, t }) => `<div class="card"><div class="muted">${esc(c.supplier)} · ${esc(dday(c.invoice_date))}</div>${holdRow(t)}</div>`).join("") : `<p>No price decisions waiting.</p>`}
+   ${regs.length ? `<h3>Register prices to check</h3><p class="muted">The shelf-tag update stopped on these so nothing was overwritten blindly.</p>${regs.map(({ c, t, o }) => `<div class="card"><div class="muted">${esc(c.supplier)} · ${esc(dday(c.invoice_date))}</div>${opRow(t, o)}</div>`).join("")}` : ""}
    ${boxq.length ? `<h3>Box sizes</h3>${boxq.map(({ c, t }) => `<div class="card"><div class="muted">${esc(c.supplier)} · ${esc(dday(c.invoice_date))}</div>${boxDecisionRow(t)}</div>`).join("")}` : ""}
    ${news.length ? `<h3>New products counted by staff</h3><p class="muted">Set these up in a chat with Claude — the staff count is recorded.</p>${news.map(({ c, t }) => `<div class="card"><div class="muted">${esc(c.supplier)} · ${esc(dday(c.invoice_date))}</div>${countRow(t)}</div>`).join("")}` : ""}
    <div class="row"><button class="secondary" onclick="S.view=null;homeScreen()">Back</button></div>`);

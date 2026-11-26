@@ -37,6 +37,8 @@
 --  * Transition: existing tag jobs become 'tag_only' (never write). When a newer AUTHORISED proposal is created for an
 --    item, its older open tag-only reminders are superseded so staff are not told to put an old label back. (A newer
 --    PENDING proposal leaves them: the register still shows that price until Josh decides.)
+--  * Operations are always read through the task's CURRENT proposal (a reused tag row keeps older revisions' operations
+--    as history only).
 --  * Staff never see Square ids: the list gives each half/quarter's name, unit, old and new price and its state.
 --  * Test isolation: price_square_get/put call pg_temp.square_mock_get/put when the session defines them (the test
 --    harness does); otherwise they call Square through square_api.
@@ -112,7 +114,8 @@ create table if not exists public.price_apply_op (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (proposal_id, square_variation_id),
-  check (state = 'blocked' or expected_cents is not null or expect_unpriced)
+  -- an unknown expected price is allowed only while blocked or once closed without a write (skipped/superseded)
+  check (state in ('blocked', 'skipped', 'superseded') or expected_cents is not null or expect_unpriced)
 );
 create index if not exists price_apply_op_task_idx on public.price_apply_op (task_id);
 create index if not exists price_apply_op_var_idx on public.price_apply_op (square_variation_id) where state in ('applying', 'ambiguous');
@@ -383,12 +386,12 @@ returns jsonb language plpgsql set search_path to 'public', 'pg_temp' as $$
 declare t delivery_tasks%rowtype; v_main text; v_done boolean; v_josh boolean; v_retry boolean; v_sum jsonb;
 begin
   select * into t from delivery_tasks where id = p_task_id;
-  select state into v_main from price_apply_op where task_id = t.id and role = 'main';
+  select state into v_main from price_apply_op where task_id = t.id and proposal_id = t.proposal_id and role = 'main';
   select coalesce(bool_and(state in ('applied', 'skipped')), true), coalesce(bool_or(state in ('conflict', 'blocked')), false),
          coalesce(bool_or(state in ('failed', 'ambiguous', 'ready')), false)
-    into v_done, v_josh, v_retry from price_apply_op where task_id = t.id and role = 'part';
+    into v_done, v_josh, v_retry from price_apply_op where task_id = t.id and proposal_id = t.proposal_id and role = 'part';
   select jsonb_build_object('ops', coalesce(jsonb_agg(jsonb_build_object('role', role, 'name', label->>'name', 'state', state) order by role, id), '[]'))
-    into v_sum from price_apply_op where task_id = t.id;
+    into v_sum from price_apply_op where task_id = t.id and proposal_id = t.proposal_id;
 
   if t.status <> 'open' then
     return jsonb_build_object('ok', t.status = 'done', 'status', t.status, 'register', case when t.status = 'done' then 'updated' end);
@@ -444,18 +447,18 @@ begin
   end if;
   select * into q from retail_price_proposal where id = t.proposal_id;
   if not found or q.status <> 'authorised' then
-    update price_apply_op set state = 'superseded', updated_at = now() where task_id = t.id and state in ('ready', 'blocked', 'failed', 'conflict');
+    update price_apply_op set state = 'superseded', updated_at = now() where task_id = t.id and proposal_id = t.proposal_id and state in ('ready', 'blocked', 'failed', 'conflict');
     update delivery_tasks set status = 'superseded', apply_state = 'superseded', done_by = 'system', done_at = now() where id = t.id;
     return jsonb_build_object('ok', false, 'status', 'superseded', 'error', 'This price is no longer current. Use the newer tag job.');
   end if;
-  select state into v_main from price_apply_op where task_id = t.id and role = 'main';
+  select state into v_main from price_apply_op where task_id = t.id and proposal_id = t.proposal_id and role = 'main';
   if v_main in ('conflict', 'blocked') then
     return price_task_settle(t.id, v_by);
   end if;
 
   with c as (
     update price_apply_op set state = 'applying', claim_token = v_token, claimed_at = now(), attempts = attempts + 1, updated_at = now()
-     where task_id = t.id and (state in ('ready', 'failed', 'ambiguous') or (state = 'applying' and claimed_at < now() - interval '2 minutes'))
+     where task_id = t.id and proposal_id = t.proposal_id and (state in ('ready', 'failed', 'ambiguous') or (state = 'applying' and claimed_at < now() - interval '2 minutes'))
     returning *)
   insert into price_apply_audit (task_id, proposal_id, op_id, idem_key, source_id, stock_item_id, square_variation_id, expected_old, new_price, outcome, by)
   select t.id, q.id, c.id, price_op_key(c.id, c.gen), t.source_id, c.stock_item_id, c.square_variation_id, c.expected_cents / 100.0, c.target_cents / 100.0, 'claimed', v_by
@@ -485,8 +488,8 @@ begin
     insert into price_apply_audit (task_id, proposal_id, op_id, idem_key, source_id, stock_item_id, square_variation_id, expected_old, new_price, outcome, by)
     select t.id, o2.proposal_id, o2.id, price_op_key(o2.id, o2.gen), t.source_id, o2.stock_item_id, o2.square_variation_id,
            o2.expected_cents / 100.0, o2.target_cents / 100.0, 'superseded_before_write', v_by
-      from price_apply_op o2 where o2.task_id = t.id and o2.claim_token = p_token and o2.state = 'applying';
-    update price_apply_op set state = 'superseded', claim_token = null, updated_at = now() where task_id = t.id and claim_token = p_token and state = 'applying';
+      from price_apply_op o2 where o2.task_id = t.id and o2.proposal_id = t.proposal_id and o2.claim_token = p_token and o2.state = 'applying';
+    update price_apply_op set state = 'superseded', claim_token = null, updated_at = now() where task_id = t.id and proposal_id = t.proposal_id and claim_token = p_token and state = 'applying';
     update delivery_tasks set status = case when status = 'open' then 'superseded' else status end, apply_state = 'superseded', claim_token = null,
            done_by = coalesce(done_by, 'system'), done_at = coalesce(done_at, now()) where id = t.id;
     return jsonb_build_object('ok', false, 'status', 'superseded', 'error', 'A newer price replaced this one. Use the newer tag job.');
@@ -495,8 +498,8 @@ begin
     return jsonb_build_object('ok', false, 'status', 'busy', 'error', 'Another attempt took over. Check again in a moment.');
   end if;
 
-  for o in select id, role from price_apply_op where task_id = t.id and claim_token = p_token and state = 'applying' order by (role <> 'main'), id loop
-    if o.role = 'part' and not exists (select 1 from price_apply_op where task_id = t.id and role = 'main' and state = 'applied') then
+  for o in select id, role from price_apply_op where task_id = t.id and proposal_id = t.proposal_id and claim_token = p_token and state = 'applying' order by (role <> 'main'), id loop
+    if o.role = 'part' and not exists (select 1 from price_apply_op where task_id = t.id and proposal_id = t.proposal_id and role = 'main' and state = 'applied') then
       update price_apply_op set state = 'ready', claim_token = null, updated_at = now() where id = o.id;   -- not attempted
       continue;
     end if;
@@ -545,7 +548,7 @@ begin
   elsif p_action = 'skip' then
     if o.role = 'main' then
       update price_apply_op set state = 'skipped', claim_token = null, updated_at = now()
-       where task_id = o.task_id and state in ('ready', 'blocked', 'failed', 'conflict');
+       where task_id = o.task_id and proposal_id = o.proposal_id and state in ('ready', 'blocked', 'failed', 'conflict');
       update retail_price_proposal set status = 'rejected', decided_at = now(), decided_by = v_by, skip_reason = 'register price kept at confirm' where id = q.id;
       update delivery_tasks set status = 'kept', apply_state = 'kept', claim_token = null, done_by = v_by, done_at = now() where id = o.task_id;
     else
@@ -558,7 +561,7 @@ begin
   insert into price_apply_audit (task_id, proposal_id, op_id, idem_key, stock_item_id, square_variation_id, expected_old, new_price, outcome, by)
   values (o.task_id, o.proposal_id, o.id, price_op_key(o.id, o.gen), o.stock_item_id, o.square_variation_id,
           coalesce(p_expected_cents, o.expected_cents) / 100.0, o.target_cents / 100.0, 'owner_' || p_action, v_by);
-  return price_task_settle(o.task_id, v_by);
+  return jsonb_build_object('ok', true, 'resolved', p_action, 'task', price_task_settle(o.task_id, v_by));
 end $$;
 
 -- 10) invoice arrival: propose + tag job (or owner hold) instead of pushing
@@ -769,7 +772,7 @@ do $m$
 declare d text := pg_get_functiondef('public.delivery_tasks_list()'::regprocedure);
 begin
   d := replace(d, $q$'id', t.id, 'kind', t.kind, 'status', t.status,$q$,
-                  $q$'id', t.id, 'kind', t.kind, 'status', t.status, 'price_mode', coalesce(t.price_mode, case when t.kind = 'tag' then 'tag_only' end), 'apply_state', t.apply_state, 'apply_result', t.apply_result, 'parts', case when t.price_mode = 'apply_on_confirm' then (select coalesce(jsonb_agg(jsonb_build_object('name', o.label->>'name', 'per', o.label->>'per', 'old', round(o.expected_cents / 100.0, 2), 'new', round(o.target_cents / 100.0, 2), 'state', o.state) order by o.id), '[]'::jsonb) from price_apply_op o where o.task_id = t.id and o.role = 'part') end,$q$);
+                  $q$'id', t.id, 'kind', t.kind, 'status', t.status, 'price_mode', coalesce(t.price_mode, case when t.kind = 'tag' then 'tag_only' end), 'apply_state', t.apply_state, 'apply_result', t.apply_result, 'parts', case when t.price_mode = 'apply_on_confirm' then (select coalesce(jsonb_agg(jsonb_build_object('op', o.id, 'name', o.label->>'name', 'per', o.label->>'per', 'old', round(o.expected_cents / 100.0, 2), 'new', round(o.target_cents / 100.0, 2), 'state', o.state, 'register_now', round((o.last_result->>'square_cents')::numeric / 100.0, 2)) order by o.id), '[]'::jsonb) from price_apply_op o where o.task_id = t.id and o.proposal_id = t.proposal_id and o.role = 'part') end, 'main', case when t.price_mode = 'apply_on_confirm' then (select jsonb_build_object('op', o.id, 'state', o.state, 'old', round(o.expected_cents / 100.0, 2), 'new', round(o.target_cents / 100.0, 2), 'register_now', round((o.last_result->>'square_cents')::numeric / 100.0, 2)) from price_apply_op o where o.task_id = t.id and o.proposal_id = t.proposal_id and o.role = 'main') end,$q$);
   if d not like '%''price_mode''%' then raise exception 'delivery_tasks_list patch did not apply'; end if;
   execute d;
 end $m$;
