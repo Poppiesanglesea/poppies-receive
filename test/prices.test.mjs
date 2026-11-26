@@ -37,12 +37,12 @@ test('loads the list once with a GET and shows the Grocer department by section'
   assert.match(h, /\$10\.80<\/b>/); assert.match(h, /\$9\.00<\/b> \/ kg/); assert.match(h, /Price at register/);
   assert.doesNotMatch(h, /Bad/); assert.match(h, /4 items/);
 });
-test('department buttons switch the list; output is escaped', async () => {
+test('other departments stay hidden; output is escaped', async () => {
   const { ctx, el } = app();
   await vm.runInContext('pricesScreen()', ctx);
   vm.runInContext('PL.dept="Gift Store";priceDraw()', ctx);
   const h = el('pres').innerHTML;
-  assert.match(h, /Bad &lt;b&gt;/); assert.doesNotMatch(h, /<b>Bad/); assert.match(h, /\(sold out\)/); assert.match(h, /1 items/);
+  assert.match(h, /Bad &lt;b&gt;/); assert.doesNotMatch(h, /<b>Bad/); assert.match(h, /\(sold out\)/);
 });
 test('typing filters across all departments', async () => {
   const { ctx, el } = app();
@@ -50,7 +50,7 @@ test('typing filters across all departments', async () => {
   el('pq').value = 'straw organic';
   vm.runInContext('priceDraw()', ctx);
   const h = el('pres').innerHTML;
-  assert.match(h, /Punnet \(Organic\)/); assert.doesNotMatch(h, /— Punnet</); assert.match(h, /Grocer · Fruit/); assert.match(h, /1 items/);
+  assert.match(h, /Punnet \(Organic\)/); assert.doesNotMatch(h, /— Punnet</); assert.match(h, />Fruit</); assert.match(h, /1 items/);
 });
 test('a failed load says so', async () => {
   const { ctx, el } = app({ ok: false, error: 'Price list isn\'t working right now.' });

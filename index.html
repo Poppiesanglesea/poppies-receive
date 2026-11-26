@@ -84,7 +84,7 @@ async function homeScreen() {
   if (r.body && r.body.owner) document.getElementById("own").innerHTML = `<div class="row" style="margin:0 0 18px"><button class="secondary" onclick="needsScreen()">Josh: products waiting for a price</button></div>`;
 }
 
-// ---------- shelf prices: full list (read-only; copy of Square refreshed every ~10 min)
+// ---------- shelf prices: retail produce list (read-only; copy of Square refreshed every ~10 min)
 let PL = { rows: [], dept: "Grocer", at: null }, priceT;
 async function pricesScreen() {
   $(`<h2>Shelf prices</h2><div class="spinner"></div>`);
@@ -92,8 +92,7 @@ async function pricesScreen() {
   if (!r.ok || !r.body.ok) return $(`<h2>Shelf prices</h2><div class="note err">${esc((r.body && r.body.error) || "Couldn't load the price list. Try again in a minute.")}</div><button class="secondary" onclick="homeScreen()">Back</button>`);
   PL.rows = r.body.rows || []; PL.at = r.body.checked_at;
   const at = PL.at ? new Date(PL.at).toLocaleString("en-AU", { timeZone: "Australia/Melbourne", hour: "numeric", minute: "2-digit", day: "numeric", month: "short" }) : "";
-  $(`<h2>Shelf prices</h2><p class="q">What the register charges, from Square${at ? ` (as at ${esc(at)})` : ""}. Tap a department, or type to filter.</p>
-  <div class="row" style="margin:0 0 10px">${["Grocer","Gift Store","Garden"].map(d => `<button id="pd-${d.replace(" ","")}" class="secondary small" onclick="PL.dept='${d}';priceDraw()">${d}</button>`).join("")}</div>
+  $(`<h2>Shelf prices</h2><p class="q">Retail produce — what the register charges, from Square${at ? ` (as at ${esc(at)})` : ""}. Type to filter.</p>
   <input id="pq" type="search" placeholder="Filter, e.g. strawberries" autocomplete="off" oninput="clearTimeout(priceT);priceT=setTimeout(priceDraw,200)">
   <div id="pres" style="margin-top:14px"></div><div class="row"><button class="secondary" onclick="homeScreen()">Back</button></div>`);
   priceDraw();
@@ -117,8 +116,7 @@ function priceTable(rows, showDept) {
 }
 function priceDraw() {
   const q = (document.getElementById("pq") || {}).value || "";
-  for (const d of ["Grocer","Gift Store","Garden"]) { const b = document.getElementById("pd-" + d.replace(" ","")); if (b) b.className = (d === PL.dept && !q.trim() ? "primary" : "secondary") + " small"; }
-  document.getElementById("pres").innerHTML = priceTable(priceFilter(PL.rows, PL.dept, q), !!q.trim());
+  document.getElementById("pres").innerHTML = priceTable(priceFilter(PL.rows, PL.dept, q), false);
 }
 
 // ---------- a delivery's products (labels)
