@@ -4,6 +4,6 @@ Staff page for the shop iPad. The page holds no keys or data; the iPad is set up
 
 - **New delivery:** photograph the invoice or docket, check the lines, and send new products for set-up in Square.
 - **Deliveries to finish** (added 26 Nov 2026): jobs from booked Harvey's and Biodynamic Grocer invoices. Staff tick shelf tags once changed, and count boxes the invoice gives no count for. Josh approves or keeps held prices from his own device.
-- **Shelf prices** (added 26 Nov 2026): a price list of retail produce (Fruit and Vegetables that are linked to an active Grocer produce stock item, including halves and quarters), with a filter box, for when a shelf tag is missing. Read-only copy of Square, refreshed when it is more than 10 minutes old; it never changes a price.
+- **Shelf prices** (added 26 Nov 2026): a price list of retail produce (Fruit and Vegetables that are linked to an active Grocer produce stock item with a sale or delivery in the last 4 weeks, including halves and quarters), with a filter box, for when a shelf tag is missing. Read-only copy of Square, refreshed when it is more than 10 minutes old; it never changes a price.
 
 Tests: `node --test test/*.test.mjs`
