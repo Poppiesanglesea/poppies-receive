@@ -104,3 +104,67 @@ test('a 503 (settings unavailable) shows a retry banner and never the "not set u
   assert.match(el('busy').innerHTML, /Try again/);
   assert.doesNotMatch(el('app').innerHTML, /isn't set up yet/);
 });
+
+// ---- 503 / network resilience (Codex synthetic findings on 39ec238)
+const unavailable = async () => ({ __status: 503, body: { error: "The app can't reach its settings right now.", retry: true } });
+
+test('supplier list 503 shows an error with retry instead of throwing', async () => {
+  const { ctx, el } = app({ '/suppliers': unavailable });
+  await settle();
+  await vm.runInContext('supplierScreen()', ctx);
+  assert.match(el('sup').innerHTML, /can&#39;t reach its settings/);
+  assert.match(el('sup').innerHTML, /onclick="supplierScreen\(\)"/);
+});
+
+test('price-needs 503 shows an error instead of throwing', async () => {
+  const { ctx, el } = app({ '/owner/needs': unavailable, '/owner/awaiting': async () => [] });
+  await settle();
+  await vm.runInContext('needsScreen()', ctx);
+  assert.match(el('app').innerHTML, /can&#39;t reach its settings/);
+  assert.match(el('app').innerHTML, /onclick="needsScreen\(\)"/);
+});
+
+test('delivery products 503 shows an error, not a blank heading and empty table', async () => {
+  const { ctx, el } = app({ '/receipts/11111111-2222-3333-4444-555555555555/items': unavailable });
+  await settle();
+  await vm.runInContext('itemsScreen("11111111-2222-3333-4444-555555555555")', ctx);
+  const h = el('app').innerHTML;
+  assert.match(h, /can&#39;t reach its settings/);
+  assert.doesNotMatch(h, /<table>/);
+});
+
+test('busy banner retry re-runs only the current read and never clears photos or the receipt', async () => {
+  const { ctx, el, reqs } = app({ '/suppliers': unavailable });
+  await settle();
+  vm.runInContext('S.dept = "Grocer"; S.photos = ["data:image/jpeg;base64,AAA"]; S.receipt = "keep-me";', ctx);
+  await vm.runInContext('supplierScreen()', ctx);
+  const before = reqs.filter(r => r.startsWith('/suppliers')).length;
+  await vm.runInContext('retryView()', ctx); await settle();
+  assert.equal(reqs.filter(r => r.startsWith('/suppliers')).length, before + 1);
+  assert.equal(vm.runInContext('S.photos.length', ctx), 1);
+  assert.equal(vm.runInContext('S.receipt', ctx), 'keep-me');
+});
+
+test('sending photos: a dropped connection keeps the photos, re-enables Send, warns it may have been saved, and does not resend', async () => {
+  const { ctx, el, reqs } = app({ '/receipts': async () => { throw new Error('network down'); } });
+  await settle();
+  vm.runInContext('S.supplier = "Supplier A"; S.dept = "Grocer"; S.photos = ["data:image/jpeg;base64,AAA"];', ctx);
+  vm.runInContext('photoScreen()', ctx);
+  el('send').disabled = false;
+  await vm.runInContext('sendPhotos()', ctx);
+  assert.equal(reqs.filter(r => r === '/receipts').length, 1, 'no automatic replay');
+  assert.equal(el('send').disabled, false);
+  assert.equal(vm.runInContext('S.photos.length', ctx), 1);
+  assert.match(el('pmsg').innerHTML, /may or may not have been saved/);
+});
+
+test('sending photos: a 503 says nothing was saved', async () => {
+  const { ctx, el } = app({ '/receipts': unavailable });
+  await settle();
+  vm.runInContext('S.supplier = "Supplier A"; S.dept = "Grocer"; S.photos = ["data:image/jpeg;base64,AAA"];', ctx);
+  vm.runInContext('photoScreen()', ctx);
+  el('send').disabled = false;
+  await vm.runInContext('sendPhotos()', ctx);
+  assert.match(el('pmsg').innerHTML, /Nothing was saved/);
+  assert.equal(el('send').disabled, false);
+});

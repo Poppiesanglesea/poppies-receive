@@ -60,22 +60,34 @@ const DEPTS = ["Garden","Gift Store","Grocer"];
 let KEY = null, OWNER = null; try { KEY = localStorage.getItem("pd_key"); OWNER = localStorage.getItem("pd_owner"); } catch(e) {}
 let S = { dept: "Garden", supplier: null, photos: [], receipt: null };
 let VIEW = 0; // bumped on every screen render; async work started on an older screen must not write into a newer one
-const $ = (h) => { VIEW++; document.getElementById("app").innerHTML = h; window.scrollTo(0,0); };
+const $ = (h) => { VIEW++; RETRY = null; clearBusy(); document.getElementById("app").innerHTML = h; window.scrollTo(0,0); };
 // JS string literal for use inside a double-quoted onclick="..." (JSON for JS, then HTML-escaped for the attribute)
 const ja = (v) => esc(JSON.stringify(String(v ?? "")));
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 async function api(path, opts = {}) {
-  const r = await fetch(API + path, { ...opts, headers: { "content-type": "application/json", "x-device-key": KEY || "", ...(OWNER ? {"x-owner-key": OWNER} : {}) } });
-  const b = await r.json().catch(() => ({}));
+  let r;
+  try { r = await fetch(API + path, { ...opts, headers: { "content-type": "application/json", "x-device-key": KEY || "", ...(OWNER ? {"x-owner-key": OWNER} : {}) } }); }
+  catch (e) { return { ok: false, status: 0, body: { error: "No connection. Check the wifi and try again." } }; }
+  let b = await r.json().catch(() => null);
+  if (!b || typeof b !== "object") b = {};
   if (r.status === 401) { noKey(); throw new Error("no key"); }
   // 503 = the back end couldn't read its settings. The key may be fine: never show the setup screen for this.
   if (r.status === 503) busyBanner(b && b.error);
   return { ok: r.ok, status: r.status, body: b };
 }
+// RETRY: the current screen's read-only loader (set by screens that only read). Write screens leave it null.
+let RETRY = null;
 function busyBanner(msg) {
-  let el = document.getElementById("busy");
+  const el = document.getElementById("busy");
   if (!el) return;
-  el.innerHTML = `<div class="note err" style="margin:0 0 14px">${esc(msg || "The app can't reach its settings right now.")} <button class="secondary small" onclick="document.getElementById('busy').innerHTML='';homeScreen()">Try again</button></div>`;
+  el.innerHTML = `<div class="note err" style="margin:0 0 14px">${esc(msg || "The app can't reach its settings right now.")} <button class="secondary small" onclick="retryView()">${RETRY ? "Try again" : "OK"}</button></div>`;
+}
+function clearBusy() { const el = document.getElementById("busy"); if (el) el.innerHTML = ""; }
+function retryView() { clearBusy(); const f = RETRY; if (f) f(); }
+// Error block for a failed read: says what happened and offers a retry of the same read only.
+function loadErr(r, what, retryCall) {
+  const msg = r && r.status === 0 ? "No connection." : r && r.status === 503 ? "The app can't reach its settings right now." : `Couldn't load ${what}.`;
+  return `<div class="note err">${esc(msg)} <button class="secondary small" onclick="${retryCall}">Try again</button></div>`;
 }
 function noKey(){ $(`<h2>This iPad isn't set up yet</h2><p>Ask Josh to open the setup link on this iPad once. After that it opens straight to the app.</p>`); }
 
@@ -90,6 +102,7 @@ async function homeScreen() {
   <div class="row" style="margin:0 0 6px">${["All", ...DEPTS].map(d => `<button id="rd-${d.replace(" ","")}" class="secondary small" onclick="RD.dept='${d}';drawRecent()">${d}</button>`).join("")}</div>
   <div class="list" id="recent"><span class="muted">Loading…</span></div><div id="months"></div>`);
   loadDeliveries();
+  RETRY = homeScreen;
   const v = VIEW;
   const [r, rd] = await Promise.all([api("/recent"), api("/recent-deliveries")]);
   if (v !== VIEW || !document.getElementById("recent")) return; // navigated away while loading
@@ -137,8 +150,12 @@ function priceDraw() {
 // ---------- a delivery's products (labels)
 async function itemsScreen(id) {
   $(`<h2>New products</h2><div class="spinner"></div>`);
+  RETRY = () => itemsScreen(id);
+  const v = VIEW;
   const r = await api(`/receipts/${id}/items`);
-  const b = r.body || {}, lines = b.lines || [];
+  if (v !== VIEW) return;
+  const b = r.body || {}, lines = Array.isArray(b.lines) ? b.lines : null;
+  if (!r.ok || !lines) return $(`<h2>New products</h2>${loadErr(r, "this delivery's products", `itemsScreen(${ja(id)})`)}<button class="secondary" onclick="homeScreen()">Back</button>`);
   const lab = { created: "In Square", known: "Already in Square", skipped: "Not stock", needs_josh: "Waiting on Josh", failed: "Problem — Josh notified", pending: "Being set up", dry_run: "Test run only (not in Square)", square_created: "In Square, linking pending" };
   $(`<h2>${esc(b.supplier)} · ${esc(b.department)}</h2>
    ${b.setup_status === "awaiting_price" ? '<p class="q">Some products are waiting for Josh to set a price in Square — don\'t print labels for those yet. They can still be sold: Square will ask for the price at the register.</p>' : ""}
@@ -151,8 +168,13 @@ async function itemsScreen(id) {
 // ---------- Josh: prices
 async function needsScreen() {
   $(`<h2>Waiting for a price</h2><div class="spinner"></div>`);
+  RETRY = needsScreen;
+  const v = VIEW;
   const [r, a] = await Promise.all([api("/owner/needs"), api("/owner/awaiting")]);
-  const rows = r.body || [], aw = (a.ok && a.body) || [];
+  if (v !== VIEW) return;
+  if (!r.ok || !Array.isArray(r.body) || !a.ok || !Array.isArray(a.body))
+    return $(`<h2>Waiting for a price</h2>${loadErr(!r.ok ? r : a, "products waiting for a price", "needsScreen()")}<button class="secondary" onclick="homeScreen()">Back</button>`);
+  const rows = r.body, aw = a.body;
   $(`<h2>Waiting for a price</h2>
    ${aw.length ? `<h3>In Square at variable price — set the price in Square</h3><p class="muted">They're already selling (staff type the price at the register). Once you set a price in Square, it comes back to Supabase overnight and staff can print labels.</p><div class="card"><table><thead><tr><th>Product</th><th>Supplier</th><th>Cost ex GST</th><th>Days</th></tr></thead><tbody>${aw.map(x => `<tr><td>${esc(x.item || "")}${x.variation && x.variation !== "Regular" ? " — " + esc(x.variation) : ""}${x.sku ? `<div class="muted">${esc(x.sku)}</div>` : ""}</td><td>${esc(x.supplier)}</td><td>${x.unit_cost_ex != null ? "$" + Number(x.unit_cost_ex).toFixed(2) : "unknown"}</td><td>${esc(String(x.days_waiting ?? ""))}</td></tr>`).join("")}</tbody></table></div>` : ""}
    ${rows.length ? `<h3>Needs checking</h3>` : aw.length ? "" : `<p>Nothing waiting.</p>`}
@@ -401,8 +423,15 @@ let SUP = { usual: [], others: [] };
 async function supplierScreen() {
   $(`<h2>${esc(S.dept)} — which supplier?</h2><input id="sq" placeholder="Search suppliers" oninput="drawSup()"><div class="grid" id="sup" style="margin-top:14px"><div class="spinner"></div></div>
   <div class="row"><button class="secondary" onclick="homeScreen()">Back</button></div>`);
+  RETRY = supplierScreen;
+  const v = VIEW;
   const r = await api("/suppliers?department=" + encodeURIComponent(S.dept));
-  SUP = r.body || { usual: [], others: [] }; drawSup();
+  if (v !== VIEW || !document.getElementById("sup")) return;
+  if (!r.ok || !Array.isArray(r.body && r.body.usual) || !Array.isArray(r.body && r.body.others)) {
+    document.getElementById("sup").innerHTML = `<div style="grid-column:1/-1">${loadErr(r, "the supplier list", "supplierScreen()")}</div>`;
+    return;
+  }
+  SUP = r.body; drawSup();
 }
 function drawSup() {
   const q = (document.getElementById("sq").value || "").toLowerCase();
@@ -435,20 +464,35 @@ function shrink(file) {
   });
 }
 async function sendPhotos() {
-  document.getElementById("send").disabled = true;
+  const v = VIEW, btn = document.getElementById("send");
+  if (!btn || btn.disabled) return;
+  btn.disabled = true;
   document.getElementById("pmsg").innerHTML = `<div class="spinner"></div>`;
-  const r = await api("/receipts", { method: "POST", body: JSON.stringify({ supplier: S.supplier, department: S.dept, images: S.photos.map(p => p.split(",")[1]) }) });
-  if (!r.ok) { document.getElementById("pmsg").innerHTML = `<div class="note err">${esc(r.body.reason || r.body.error || "Couldn't send")}</div>`; document.getElementById("send").disabled = false; return; }
+  let r;
+  try { r = await api("/receipts", { method: "POST", body: JSON.stringify({ supplier: S.supplier, department: S.dept, images: S.photos.map(p => p.split(",")[1]) }) }); }
+  catch (e) { return; } // 401: the setup screen has already been shown
+  if (v !== VIEW || !document.getElementById("pmsg")) return;
+  if (!r.ok || !(r.body && r.body.id)) {
+    // Not replayed automatically. 503 is rejected before anything is saved; a lost connection or server error may or may not have saved it.
+    const sure = r.status === 503 || r.status === 400;
+    const msg = sure ? `${r.body.error || "Couldn't send."} Nothing was saved — your photos are still here. Tap Send to try again.`
+      : `${r.body.reason || r.body.error || "Couldn't send."} It may or may not have been saved. Check Recent deliveries on the home screen before sending again — your photos are still here.`;
+    document.getElementById("pmsg").innerHTML = `<div class="note err">${esc(msg)}</div>`;
+    const b2 = document.getElementById("send"); if (b2) b2.disabled = !S.photos.length;
+    return;
+  }
   S.receipt = r.body.id; readingScreen();
 }
 
 // ---------- reading
 async function readingScreen() {
   $(`<h2>Reading it…</h2><p class="q">Usually under a minute. You can keep unpacking.</p><div class="spinner"></div>`);
-  const t0 = Date.now();
+  const t0 = Date.now(), v = VIEW;
   while (Date.now() - t0 < 240000) {
     await new Promise(r => setTimeout(r, 4000));
+    if (v !== VIEW) return; // navigated away; the delivery shows under Recent deliveries when ready
     const r = await api("/receipts/" + S.receipt);
+    if (v !== VIEW) return;
     if (r.body.status === "ready") return linesScreen(r.body);
     if (r.body.status === "error") return $(`<h2>Couldn't read it</h2><div class="note err">${esc(r.body.hold_reason || "Unknown problem")}</div><p>The photos are saved. Leave the paperwork for Josh.</p><button class="primary" onclick="homeScreen()">Done</button>`);
   }
