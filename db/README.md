@@ -7,6 +7,8 @@
 | `rollback/20261126_provenance_02_schema_rollback.sql` | Validated locally (refuses if tables used / exceptions reviewed) |
 | `migrations/20261126_pricing_03_tag_confirm.sql` (rev 2) | **Staged, not applied** — validated locally |
 | `rollback/20261126_pricing_03_tag_confirm_rollback.sql` | Validated locally (refuses while a register update is in flight or in doubt; keeps audit + operation evidence) |
+| `migrations/20261127_delivery_line_known.sql` | Applied 27 Nov 2026 (read-only lookup for known barcodes; Edge v18 uses it) |
+| `migrations/20261127_delivery_name_close.sql` | Applied 27 Nov 2026 (count-job name matching: spelling variants + abbreviations) |
 | `tests/run_local.sh` | Reproducible local run of everything below (disposable PostgreSQL 16+ with dblink) |
 
 Applied directly (narrowing / read-only, before or alongside this folder): app RPC privilege narrowing,
