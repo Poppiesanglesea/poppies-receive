@@ -27,9 +27,9 @@ import { ConfigUnavailable, makeCfg, whoFromHeaders } from "./auth.ts";
 import { createReceipt, reconcileReceipt, type Deps, type Receipt } from "./receipts.ts";
 import { confirmTag, type RpcErr } from "./tags.ts";
 
-export const BUILD = "delivery-app v17 2026-11-26";
+export const BUILD = "delivery-app v18 2026-11-27 known-barcodes";
 // SOURCE_SHA is written by scripts/check-edge.mjs --write: sha-256 of index.ts (with this one line removed), auth.ts, receipts.ts and tags.ts.
-export const SOURCE_SHA = { index: "ff22b83043c1d59df609af878380b271677834693922bf26c193761007d3c997", auth: "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331", receipts: "0bbd4a7723ef2f7b146ac729ab08c45034a4d6dd04fecb3ef6c1adf72f199afe", tags: "0866c0de5065b546c54c8211853388e3316ec5fa4d297f70f12f30c2ed340c3d" };
+export const SOURCE_SHA = { index: "5c8c565a878ad544a0e4055d9154ffa1584a4006aeff0d3c6ac6b415d0c773c6", auth: "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331", receipts: "0bbd4a7723ef2f7b146ac729ab08c45034a4d6dd04fecb3ef6c1adf72f199afe", tags: "0866c0de5065b546c54c8211853388e3316ec5fa4d297f70f12f30c2ed340c3d" };
 
 const URL_ = Deno.env.get("SUPABASE_URL")!;
 const SB = createClient(URL_, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
@@ -319,7 +319,14 @@ Deno.serve(async (req) => {
         } else if (rec.status === "error") {
           Object.assign(rec, await reconcileReceipt(DEPS, rec as Receipt));     // failed reader hand-off: retry from the stored PDF
         }
-        return json({ id: rec.id, status: rec.status, supplier: rec.supplier, department: rec.department, extraction: rec.extraction, setup_status: rec.setup_status, hold_reason: rec.hold_reason });
+        // known: per invoice line, the existing product it matches and the barcode Square already holds (27 Nov 2026).
+        // Display only; never sent back as a barcode. A lookup failure just shows empty boxes, as before.
+        let known: unknown[] = [];
+        if (rec.status === "ready" && Array.isArray(rec.extraction?.lines) && rec.extraction.lines.length) {
+          const { data: k } = await SB.rpc("delivery_line_known", { p_supplier: rec.supplier, p_department: rec.department, p_lines: rec.extraction.lines });
+          if (Array.isArray(k)) known = k;
+        }
+        return json({ id: rec.id, status: rec.status, supplier: rec.supplier, department: rec.department, extraction: rec.extraction, known, setup_status: rec.setup_status, hold_reason: rec.hold_reason });
       }
 
       if (req.method === "GET" && m[2] === "/items") {

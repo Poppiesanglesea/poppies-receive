@@ -602,7 +602,8 @@ let REC = null, LINES = [];
 function norm(s){ return String(s||"").toLowerCase().replace(/[^a-z0-9]/g,""); }
 function linesScreen(rec) {
   REC = rec; const x = rec.extraction || {};
-  LINES = (x.lines || []).map(l => ({ description: l.description, invoice_description: l.description, sku: l.sku, qty: l.qty, unit: l.unit, unit_price: l.unit_price, source: "invoice", note: "", barcode: "" }));
+  const known = Array.isArray(rec.known) ? rec.known : [];
+  LINES = (x.lines || []).map((l, i) => ({ description: l.description, invoice_description: l.description, sku: l.sku, qty: l.qty, unit: l.unit, unit_price: l.unit_price, source: "invoice", note: "", barcode: "", known: known[i] || null }));
   const printed = x.supplier_printed || "";
   const supWarn = printed && !norm(printed).includes(norm(rec.supplier).slice(0,6)) && !norm(rec.supplier).includes(norm(printed).slice(0,6));
   $(`<h2>What came in?</h2><p class="q">Make this list match what's actually on the bench. Rename a line to what the product really is, split "assorted" lines into each kind with how many, and add anything missing. Counts = what actually arrived.</p>
@@ -620,14 +621,24 @@ function linesScreen(rec) {
 }
 function drawLines() {
   document.getElementById("ln").innerHTML = LINES.map((l,i)=>`<tr>
-   <td><input value="${esc(l.description)}" onchange="LINES[${i}].description=this.value">${l.source!=="invoice"?`<span class="tag">${l.split_group ? "part of: " + esc(l.invoice_description||"") + (l.split_total!=null ? " (" + l.split_total + ")" : "") : l.source}</span>`:""}</td>
+   <td><input value="${esc(l.description)}" onchange="renameLine(${i}, this.value)">${l.source!=="invoice"?`<span class="tag">${l.split_group ? "part of: " + esc(l.invoice_description||"") + (l.split_total!=null ? " (" + l.split_total + ")" : "") : l.source}</span>`:""}</td>
    <td><input inputmode="decimal" value="${esc(l.qty)}" onchange="LINES[${i}].qty=this.value"></td>
    <td><input value="${esc(l.unit)}" onchange="LINES[${i}].unit=this.value"></td>
    <td><input inputmode="decimal" value="${esc(l.unit_price)}" onchange="LINES[${i}].unit_price=this.value"></td>
    <td><button class="secondary small" onclick="splitLine(${i})">Split</button> <button class="secondary small" onclick="LINES.splice(${i},1);drawLines()">✕</button></td></tr>
    <tr class="sub"><td colspan="5"><div style="display:flex;gap:8px"><input placeholder="Note for set-up (optional), e.g. 'pink flowers', 'size small'" value="${esc(l.note)}" onchange="LINES[${i}].note=this.value" style="font-size:14px;padding:6px;flex:2">
-   <input placeholder="Barcode" inputmode="numeric" value="${esc(l.barcode)}" onchange="LINES[${i}].barcode=this.value" style="font-size:14px;padding:6px;flex:1"><button class="secondary small" onclick="scanFor(${i})">Scan</button></div></td></tr>`).join("");
+   ${barcodeCell(l, i)}</div>${l.known ? `<div class="muted" style="font-size:13px;margin-top:4px">Already in Square: ${esc(l.known.name)}</div>` : ""}</td></tr>`).join("");
 }
+// A line that matches an existing product shows the barcode Square already holds (read-only, not re-sent).
+// A matched product with no barcode says so: set-up only uses a scanned barcode when it creates a NEW product,
+// so offering a scan there would not save anything. New products get the empty box and Scan button as before.
+function barcodeCell(l, i) {
+  if (l.known && l.known.upc) return `<input value="${esc(l.known.upc)}" readonly title="Barcode already in Square" aria-label="Barcode already in Square" style="font-size:14px;padding:6px;flex:1;background:#f1f1f1;color:#555"><span class="muted" style="font-size:13px;align-self:center">✓ on file</span>`;
+  if (l.known) return `<span class="muted" style="font-size:13px;flex:1;align-self:center">No barcode in Square for this product</span>`;
+  return `<input placeholder="Barcode" inputmode="numeric" value="${esc(l.barcode)}" onchange="LINES[${i}].barcode=this.value" style="font-size:14px;padding:6px;flex:1"><button class="secondary small" onclick="scanFor(${i})">Scan</button>`;
+}
+// Renaming a line away from the invoice wording means it may be a different product: drop the match so the barcode box returns.
+function renameLine(i, v){ const l = LINES[i]; l.description = v; if (l.known && v !== l.invoice_description) { l.known = null; drawLines(); } }
 function addLine(){ LINES.push({ description:"", qty:"", unit:"", unit_price:"", source:"added", note:"", barcode:"" }); drawLines(); }
 // Splitting an invoice line (e.g. "Assorted 140mm x 20") turns the original and its parts into one group.
 // The group keeps the invoice count as split_total; the parts' counts must add up to it (checked here and on the server).
@@ -638,7 +649,7 @@ function splitLine(i){
   if (!l.split_group) {
     const g = "g" + (++GROUP_SEQ);
     l.split_group = g; l.split_total = l.qty === "" || l.qty == null ? null : Number(l.qty);
-    l.split_sku = l.sku || null; l.sku = null; l.source = "split"; l.qty = "";
+    l.split_sku = l.sku || null; l.sku = null; l.source = "split"; l.qty = ""; l.known = null;   // split parts are different products
   }
   LINES.splice(i+1, 0, { description: l.description, invoice_description: l.invoice_description, qty: "", unit: l.unit, unit_price: l.unit_price,
     sku: null, split_sku: l.split_sku, split_group: l.split_group, split_total: l.split_total, source: "split", note: "", barcode: "" });
@@ -695,7 +706,7 @@ async function submitLines() {
   try {
     const r = await api(path + "/submit", { method: "POST", body: JSON.stringify({
       invoice_number: document.getElementById("inv").value,
-      invoice_date: document.getElementById("dt").value, lines: live
+      invoice_date: document.getElementById("dt").value, lines: live.map(({ known, ...l }) => l)   // known = display only, never sent
     }) });
     if (!r.ok) {
       if (r.status === 409) {
