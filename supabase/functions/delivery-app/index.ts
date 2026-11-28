@@ -25,6 +25,8 @@
 //   product planned while set-up was in test mode. /recent lists only photo receipts (origin = 'photo').
 // v20 (28 Nov 2026, review fixes): POST /owner/tasks/:id/decide refuses approve with a blank typed price ("") instead of
 //   letting the database fall back to the worked-out price. A null/absent price (quick buttons, box sizes) is unchanged.
+// v21 (28 Nov 2026, review fixes 2): POST /receipts/:id/cancel only cancels a receipt that is not 'submitted' (checked in the
+//   write, not just the read). GET /receipts/:id moves a receipt to ready/error only while it is still 'reading'.
 // v16 (26 Nov 2026): POST /receipts accepts a client op_id (uuid) and uses it as the receipt id, so re-sending the same
 //   photo set after an uncertain failure returns the existing receipt instead of creating a duplicate delivery.
 import { createClient } from "jsr:@supabase/supabase-js@2";
@@ -34,9 +36,9 @@ import { createReceipt, reconcileReceipt, type Deps, type Receipt } from "./rece
 import { confirmTag, type RpcErr } from "./tags.ts";
 import { retailOwnerRoute, retailRoute } from "./retail.ts";
 
-export const BUILD = "delivery-app v20 2026-11-28 review-fixes";
+export const BUILD = "delivery-app v21 2026-11-28 review-fixes-2";
 // SOURCE_SHA is written by scripts/check-edge.mjs --write: sha-256 of index.ts (with this one line removed), auth.ts, receipts.ts, tags.ts and retail.ts.
-export const SOURCE_SHA = { index: "563d4c68542a5b117dfb83ef2394dd262a6e8767e1da9b0a738a1a61a3b1169e", auth: "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331", receipts: "0bbd4a7723ef2f7b146ac729ab08c45034a4d6dd04fecb3ef6c1adf72f199afe", tags: "0866c0de5065b546c54c8211853388e3316ec5fa4d297f70f12f30c2ed340c3d", retail: "ba5b57337b58cc61ffd90daf4586f78be1f510168961cd21505e40e9362b6ff8" };
+export const SOURCE_SHA = { index: "92035824ea0959f4e11174acad98593d4a90b9c0fdc338de1ee93cb4598ebe6f", auth: "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331", receipts: "0bbd4a7723ef2f7b146ac729ab08c45034a4d6dd04fecb3ef6c1adf72f199afe", tags: "0866c0de5065b546c54c8211853388e3316ec5fa4d297f70f12f30c2ed340c3d", retail: "ba5b57337b58cc61ffd90daf4586f78be1f510168961cd21505e40e9362b6ff8" };
 
 const URL_ = Deno.env.get("SUPABASE_URL")!;
 const SB = createClient(URL_, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
@@ -340,13 +342,20 @@ Deno.serve(async (req) => {
       if (req.method === "GET" && !m[2]) {
         if (rec.status === "reading") {
           const { data: q } = await SB.from("invoice_ingest_queue").select("status, extraction, checks, hold_reason").eq("source_id", rec.source_id).maybeSingle();
-          if (q && q.extraction && q.status !== "received") {
-            const ext = { ...q.extraction, reader_holds: q.hold_reason, mapped: q.checks?.mapped ?? [], duplicate_of: q.checks?.duplicate_of ?? null };
-            await SB.from("delivery_receipts").update({ status: "ready", extraction: ext }).eq("id", rec.id);
-            rec.status = "ready"; rec.extraction = ext;
-          } else if (q && ["error", "skipped_not_stock"].includes(q.status)) {
-            await SB.from("delivery_receipts").update({ status: "error", hold_reason: q.hold_reason }).eq("id", rec.id);
-            rec.status = "error"; rec.hold_reason = q.hold_reason;
+          // Only move a receipt that is still 'reading' (v21): a slow poll must never flip a receipt that has meanwhile been
+          // sent ('submitted') back to 'ready', which would allow a second send. If nothing matched, re-read the row.
+          const patch = q && q.extraction && q.status !== "received"
+            ? { status: "ready", extraction: { ...q.extraction, reader_holds: q.hold_reason, mapped: q.checks?.mapped ?? [], duplicate_of: q.checks?.duplicate_of ?? null } }
+            : q && ["error", "skipped_not_stock"].includes(q.status) ? { status: "error", hold_reason: q.hold_reason } : null;
+          if (patch) {
+            const { data: moved, error: mvErr } = await SB.from("delivery_receipts").update(patch).eq("id", rec.id).eq("status", "reading").select("id");
+            if (mvErr) return json({ error: "Couldn't load this delivery." }, 500);
+            if (moved?.length) Object.assign(rec, patch);
+            else {
+              const { data: cur, error: curErr } = await SB.from("delivery_receipts").select("*").eq("id", rec.id).maybeSingle();
+              if (curErr || !cur) return json({ error: "Couldn't load this delivery." }, 500);
+              Object.assign(rec, cur);
+            }
           } else if (!q) {
             Object.assign(rec, await reconcileReceipt(DEPS, rec as Receipt));   // lost reader hand-off: re-send the stored PDF
           }
@@ -368,8 +377,11 @@ Deno.serve(async (req) => {
       }
 
       if (req.method === "POST" && m[2] === "/cancel") {
-        if (rec.status === "submitted") return json({ error: "already sent for set-up" }, 409);
-        await SB.from("delivery_receipts").update({ status: "cancelled" }).eq("id", rec.id);
+        if (rec.status === "submitted") return json({ error: "already sent for set-up", status: "submitted" }, 409);
+        // conditional (v21): a send that commits between the read above and this write must win over the cancel
+        const { data: cx, error: cxErr } = await SB.from("delivery_receipts").update({ status: "cancelled" }).eq("id", rec.id).neq("status", "submitted").select("id");
+        if (cxErr) return json({ error: "Couldn't cancel. Try again." }, 500);
+        if (!cx?.length) return json({ error: "already sent for set-up", status: "submitted" }, 409);
         return json({ status: "cancelled" });
       }
 

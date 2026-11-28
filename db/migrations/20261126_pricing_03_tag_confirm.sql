@@ -59,6 +59,16 @@
 --   No Square writes, no price changes and no stock changes happen when this file is applied.
 -- Apply as ONE transaction. Rollback: db/rollback/20261126_pricing_03_tag_confirm_rollback.sql (keeps audit evidence).
 
+-- re-run guard (added 28 Nov 2026 review; 03 was applied 26 Nov). A second run would store 03's own definitions under
+-- 'pre-tag-confirm-2026-11-26' (fn_backup_restore takes the newest row), so the rollback would "restore" 03, and the
+-- delivery_tasks_list patch would be applied twice. The rollback drops delivery_tag_claim, so re-applying after a
+-- rollback still works.
+do $rerun$ begin
+  if to_regprocedure('public.delivery_tag_claim(bigint,text)') is not null then
+    raise exception 'pricing_03 refused: it is already applied (delivery_tag_claim exists). Roll it back first to re-apply.';
+  end if;
+end $rerun$;
+
 -- 0) rollback point
 insert into public.function_backup (label, fn_name, signature, definition)
 select 'pre-tag-confirm-2026-11-26', p.proname, p.oid::regprocedure::text, pg_get_functiondef(p.oid)
