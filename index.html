@@ -500,7 +500,11 @@ async function searchItems(id) {
   const q = document.getElementById("q" + id).value, box = document.getElementById("cs" + id);
   box.innerHTML = `<span class="muted">Searching…</span>`;
   const r = await api(`/tasks/${id}/search?q=` + encodeURIComponent(q));
-  const rows = (r.ok && r.body) || [];
+  if (!r.ok || !Array.isArray(r.body)) {
+    box.innerHTML = '<span class="note err">Product search failed. Check the connection and try again.</span>';
+    return;
+  }
+  const rows = r.body;
   box.innerHTML = rows.length ? rows.map(o => `<label style="display:block;padding:6px 0"><input type="radio" name="c${id}" value="${o.stock_item_id}" data-unit="${esc(o.count_unit)}" data-last="${o.last_count ?? ""}" style="width:auto" onchange="countUnit(${id})"> ${esc(o.name)}</label>`).join("")
     : `<span class="muted">Nothing found that can be used for this supplier. If it's new, choose "None of these".</span>`;
 }
@@ -510,8 +514,9 @@ function saveCount(id) {
   if (!r) { m.innerHTML = `<div class="note err">Pick what it is, or "None of these".</div>`; return; }
   if (!(n > 0)) { m.innerHTML = `<div class="note err">Enter how many came in one box.</div>`; return; }
   const last = Number(r.dataset.last);
-  if (last > 0 && Math.abs(n - last) / last > 0.5 && !m.dataset.confirmed) {
-    m.dataset.confirmed = "1";
+  const confirmation = JSON.stringify([r.value, last, n]);
+  if (last > 0 && Math.abs(n - last) / last > 0.5 && m.dataset.confirmed !== confirmation) {
+    m.dataset.confirmed = confirmation;
     m.innerHTML = `<div class="note">The last box of this had ${last}. Please recount, then tap Save count again to confirm ${n}.</div>`;
     return;
   }
