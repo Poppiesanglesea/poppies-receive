@@ -65,8 +65,8 @@ create function public.produce_price_label(p_stock_item_id bigint, p_variation t
 $function$;
 create function public.square_api(m text, p text, b jsonb) returns jsonb language plpgsql as $$
   begin raise exception 'square_api must never be called in local tests (% %)', m, p; end $$;
-create function public.square_set_variation_price(v text, c int) returns jsonb language plpgsql as $$
-  begin raise exception 'legacy square_set_variation_price must not be called (%)', v; end $$;
+create function public.square_set_variation_price(p_variation_id text, p_cents int) returns jsonb language plpgsql as $$
+  begin raise exception 'legacy square_set_variation_price must not be called (%)', p_variation_id; end $$;
 -- FIXTURE: half/quarter repricing. Production computes 'to' from the parent's cost and takes 'from' from
 -- retail_part_variation_price (null when no price was ever recorded); tests set rows in test_part_prices.
 create table public.test_part_prices (stock_item_id bigint, variation text, to_price numeric);
