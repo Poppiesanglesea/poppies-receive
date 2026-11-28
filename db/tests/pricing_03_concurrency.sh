@@ -6,7 +6,7 @@
 # superseded unwritten. Prints pass/FAIL lines.
 D=${1:-poppies_t03}; CONN=$2; HERE=$(cd "$(dirname "$0")" && pwd)
 sess() { { echo "\\set ON_ERROR_STOP on"; echo "select set_config('test.mock_conn', :'mock_conn', false);";
-           echo "\\i $HERE/local/mock_session.sql"; echo "\\i $HERE/local/test_helpers.sql"; echo "$1"; } > "$2"
+           echo "\\i '$HERE/local/mock_session.sql'"; echo "\\i '$HERE/local/test_helpers.sql'"; echo "$1"; } > "$2"
          psql -X -q -At -v mock_conn="$CONN" -d $D -f "$2" 2>&1; }
 q() { psql -X -q -At -d $D -c "$1"; }
 mock() { q "select v from dblink('$CONN', \$\$$1\$\$) t(v int)"; }

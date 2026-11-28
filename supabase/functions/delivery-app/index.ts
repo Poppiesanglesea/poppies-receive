@@ -25,6 +25,8 @@
 //   product planned while set-up was in test mode. /recent lists only photo receipts (origin = 'photo').
 // v20 (28 Nov 2026, review fixes): POST /owner/tasks/:id/decide refuses approve with a blank typed price ("") instead of
 //   letting the database fall back to the worked-out price. A null/absent price (quick buttons, box sizes) is unchanged.
+// v22 (28 Nov 2026, review fixes 3): POST /tasks/:id/search is no longer treated as a count; a blank/zero count and a
+//   non-integer stock_item_id are refused (400) instead of being sent on; retail "existing" needs a whole stock_item_id.
 // v21 (28 Nov 2026, review fixes 2): POST /receipts/:id/cancel only cancels a receipt that is not 'submitted' (checked in the
 //   write, not just the read). GET /receipts/:id moves a receipt to ready/error only while it is still 'reading'.
 // v16 (26 Nov 2026): POST /receipts accepts a client op_id (uuid) and uses it as the receipt id, so re-sending the same
@@ -36,9 +38,9 @@ import { createReceipt, reconcileReceipt, type Deps, type Receipt } from "./rece
 import { confirmTag, type RpcErr } from "./tags.ts";
 import { retailOwnerRoute, retailRoute } from "./retail.ts";
 
-export const BUILD = "delivery-app v21 2026-11-28 review-fixes-2";
+export const BUILD = "delivery-app v22 2026-11-28 review-fixes-3";
 // SOURCE_SHA is written by scripts/check-edge.mjs --write: sha-256 of index.ts (with this one line removed), auth.ts, receipts.ts, tags.ts and retail.ts.
-export const SOURCE_SHA = { index: "92035824ea0959f4e11174acad98593d4a90b9c0fdc338de1ee93cb4598ebe6f", auth: "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331", receipts: "0bbd4a7723ef2f7b146ac729ab08c45034a4d6dd04fecb3ef6c1adf72f199afe", tags: "0866c0de5065b546c54c8211853388e3316ec5fa4d297f70f12f30c2ed340c3d", retail: "ba5b57337b58cc61ffd90daf4586f78be1f510168961cd21505e40e9362b6ff8" };
+export const SOURCE_SHA = { index: "87ac702a40aa814a164ae549abcdf7d25f99914e6d52d97284ec33bf74588b23", auth: "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331", receipts: "0bbd4a7723ef2f7b146ac729ab08c45034a4d6dd04fecb3ef6c1adf72f199afe", tags: "0866c0de5065b546c54c8211853388e3316ec5fa4d297f70f12f30c2ed340c3d", retail: "7cacebf290b81d11a0659f5fc265015578d307fdf11db1e2bdc141ff9f9533cf" };
 
 const URL_ = Deno.env.get("SUPABASE_URL")!;
 const SB = createClient(URL_, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
@@ -114,6 +116,14 @@ function sweepSoon() {
   lastSweep = Date.now();
   // deno-lint-ignore no-explicit-any
   (globalThis as any).EdgeRuntime.waitUntil(setup({ sweep: true }).catch(() => null));
+}
+
+// A staff box count: a positive number (number or numeric string). Blank, missing, zero or junk -> null.
+export function parseCount(v: unknown): number | null {
+  if (typeof v === "number") return Number.isFinite(v) && v > 0 && v <= 100000 ? v : null;
+  if (typeof v !== "string" || !v.trim()) return null;
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 && n <= 100000 ? n : null;
 }
 
 export function validateLines(raw: unknown): [Record<string, unknown>[], string | null] {
@@ -298,7 +308,7 @@ Deno.serve(async (req) => {
         if (error) return json({ error: error.message }, 500);
         return json(data ?? []);
       }
-      if (req.method === "POST") {
+      if (req.method === "POST" && tm[2] !== "search") {   // v22: POST /search used to fall through to the count answer
         const b = await req.json().catch(() => ({}));
         const by = String(b.by ?? "").trim().slice(0, 40);
         const names = (await cfg("delivery_staff_names")).split(",").map((n) => n.trim());
@@ -307,12 +317,14 @@ Deno.serve(async (req) => {
           const out = await confirmTag((fn, args) => SB.rpc(fn, args) as unknown as Promise<{ data: any; error: RpcErr }>, id, by);
           return json(out.body, out.status);
         }
-        const { data, error } = tm[2] === "tick"
-          ? await SB.rpc("delivery_task_tick", { p_task_id: id, p_by: by })
-          : await SB.rpc("delivery_count_answer", {
-              p_task_id: id, p_stock_item_id: b.stock_item_id == null ? null : Number(b.stock_item_id),
-              p_count: Number.isFinite(Number(b.count)) ? Number(b.count) : null, p_by: by, p_note: b.note ? String(b.note).slice(0, 300) : null,
-            });
+        // v22: a blank or missing count is refused, not booked as 0 (Number("") and Number(null) are 0)
+        const count = parseCount(b.count);
+        if (count === null) return json({ error: "Enter how many came in one box." }, 400);
+        const item = b.stock_item_id == null ? null : Number(b.stock_item_id);
+        if (item !== null && !(Number.isSafeInteger(item) && item > 0)) return json({ error: "Pick what it is, or \"None of these\"." }, 400);
+        const { data, error } = await SB.rpc("delivery_count_answer", {
+          p_task_id: id, p_stock_item_id: item, p_count: count, p_by: by, p_note: b.note ? String(b.note).slice(0, 300) : null,
+        });
         if (error) return json({ error: error.message }, 500);
         return json(data, data?.ok ? 200 : 400);
       }

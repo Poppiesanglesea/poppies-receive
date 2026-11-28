@@ -374,7 +374,11 @@ begin
     v_carton := nullif(regexp_replace(coalesce(u.sku, ''), '\D', '', 'g'), '');
 
     if p_action = 'existing' then
-      if jsonb_typeof(v_body->'stock_item_id') is distinct from 'number' then
+      -- a whole positive number only: a fraction would make the ::bigint cast raise, which the app reports as "uncertain"
+      -- and asks staff to retry forever (28 Nov review)
+      if jsonb_typeof(v_body->'stock_item_id') is distinct from 'number'
+         or (v_body->>'stock_item_id')::numeric <> trunc((v_body->>'stock_item_id')::numeric)
+         or (v_body->>'stock_item_id')::numeric < 1 then
         return jsonb_build_object('http', 400, 'body', jsonb_build_object('ok', false, 'code', 'invalid', 'error', 'Pick the product.'));
       end if;
       v_item := (v_body->>'stock_item_id')::bigint;
@@ -413,7 +417,7 @@ begin
         if not delivery_gtin_ok(v_barcode) then
           return jsonb_build_object('http', 400, 'body', jsonb_build_object('ok', false, 'code', 'barcode_invalid', 'error', 'That barcode didn''t scan properly. Scan it again.'));
         end if;
-        if (v_carton is not null and lpad(v_barcode, 14, '0') = lpad(v_carton, 14, '0')) or v_barcode ~ '^[1-8][0-9]{13}$' then
+        if (v_carton is not null and lpad(v_barcode, 14, '0') = lpad(v_carton, 14, '0')) or v_barcode ~ '^[1-9][0-9]{13}$' then  -- 1-8 trade units, 9 variable-measure (28 Nov review)
           return jsonb_build_object('http', 400, 'body', jsonb_build_object('ok', false, 'code', 'carton_barcode',
             'error', 'That is the carton''s barcode. Scan the barcode on one item you would sell.'));
         end if;
@@ -575,10 +579,10 @@ begin
   d := replace(d, $a$  if v_upc is not null and length(v_upc) not between 8 and 14 then v_upc := null; end if;$a$,
     $a$  if v_upc is not null and length(v_upc) not between 8 and 14 then v_upc := null; end if;
   -- a carton (trade unit) code is never the shelf barcode
-  if v_upc is not null and (v_upc ~ '^[1-8][0-9]{13}$'
+  if v_upc is not null and (v_upc ~ '^[1-9][0-9]{13}$'
        or lpad(v_upc, 14, '0') = lpad(nullif(regexp_replace(coalesce(i->>'carton_code', ''), '\D', '', 'g'), ''), 14, '0')) then
     v_upc := nullif(regexp_replace(coalesce(i->>'barcode', ''), '\D', '', 'g'), '');
-    if v_upc is not null and (v_upc ~ '^[1-8][0-9]{13}$' or length(v_upc) not between 8 and 14) then v_upc := null; end if;
+    if v_upc is not null and (v_upc ~ '^[1-9][0-9]{13}$' or length(v_upc) not between 8 and 14) then v_upc := null; end if;
   end if;$a$);
   if d = o then raise exception 'new_stock_apply patch 3 (carton upc) did not apply'; end if;
   o := d;
