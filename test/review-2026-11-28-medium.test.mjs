@@ -78,3 +78,24 @@ test('Cancel does nothing while a send is in flight', async () => {
   await a.run('cancelRec()');
   assert.equal(posts(a, '/cancel').length, 0);
 });
+
+// Review fixes, minor (28 Nov 2026): clearer outcomes for failed photo sends.
+function sender(reply) {
+  const a = app({ reply: p => p === '/receipts' ? reply : { ok: true } });
+  a.run('S = { dept: "Grocer", supplier: "Supplier C", photos: ["data:image/jpeg;base64,/9j/AA=="], receipt: null, op: "11111111-2222-3333-4444-555555555555" }');
+  a.run('$(`<div id="pmsg"></div><button id="send"></button>`)');
+  return a;
+}
+test('photos saved but the reader hand-off failed (502 with id): follows the delivery instead of asking to resend', async () => {
+  const a = sender({ status: 502, body: { id: 'aaaaaaaa-2222-3333-4444-555555555555', status: 'error', reason: 'reader down' } });
+  await a.run('sendPhotos()');
+  assert.equal(a.run('S.receipt'), 'aaaaaaaa-2222-3333-4444-555555555555');
+  assert.match(a.el('app').innerHTML, /Reading it/);
+});
+test('upload id used for different photos (409): a fresh id, and a plain explanation', async () => {
+  const a = sender({ status: 409, body: { error: 'This upload id belongs to a different delivery.' } });
+  await a.run('sendPhotos()');
+  assert.notEqual(a.run('S.op'), '11111111-2222-3333-4444-555555555555');
+  assert.match(a.el('pmsg').innerHTML, /go as a new delivery/);
+  assert.equal(a.run('S.receipt'), null);
+});

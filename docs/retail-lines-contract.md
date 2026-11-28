@@ -171,7 +171,7 @@ code printed on the invoice is usually the carton barcode.
 | `cost_above_shelf` | soft | existing | invoice_unit_cost_ex / units ≥ the shelf price ex GST (a carton booked as one item) |
 | `cost_differs` | soft | existing | invoice_unit_cost_ex / units outside 0.5×–2× the product's last unit cost |
 | `barcode_invalid` | hard | new | not 8/12/13/14 digits or GS1 check digit wrong |
-| `carton_barcode` | hard | new | barcode equals the invoice's carton code, or is a GTIN-14 with indicator 1–8 |
+| `carton_barcode` | hard | new | barcode equals the invoice's carton code, or is a GTIN-14 with indicator 1–9 (9 = variable-measure trade item) |
 | `barcode_known` | hard | new | barcode already on an active Square product (`product` names it: use "existing") |
 | `barcode_required` | hard | new | Grocer, no barcode, `no_barcode` not true or no `note` |
 | `booking_failed` | hard | existing | the mapping did not book this line; all of it was undone |

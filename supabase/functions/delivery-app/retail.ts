@@ -64,6 +64,11 @@ export async function retailRoute(rpc: Rpc, method: string, path: string, url: U
   const by = String(body.by ?? "").trim().slice(0, 40);
   if (!(await staff()).includes(by)) return { status: 400, body: { ok: false, code: "invalid", error: "Pick your name first." } };
   if (JSON.stringify(body).length > 4000) return { status: 400, body: { ok: false, code: "invalid", error: "Too much text." } };
+  // Malformed numbers are a definite 400 here (28 Nov review): passed on, a fraction made the database cast raise, which
+  // looked like an uncertain save and asked staff to retry the same request forever.
+  if (m[2] === "existing" && !(Number.isSafeInteger(body.stock_item_id) && (body.stock_item_id as number) > 0)) {
+    return { status: 400, body: { ok: false, code: "invalid", error: "Pick the product." } };
+  }
   const { data, error } = await call(rpc, "delivery_retail_answer", { p_unmatched_id: id, p_action: m[2], p_body: body, p_op_id: op, p_by: by });
   // No reply (or an error reply) does not prove nothing was saved: report it as uncertain; re-sending the same op_id is safe.
   if (error) return { status: 503, body: UNCERTAIN };

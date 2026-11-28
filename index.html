@@ -759,6 +759,20 @@ async function sendPhotos() {
   try { r = await api("/receipts", { method: "POST", body: JSON.stringify({ op_id: S.op, supplier: S.supplier, department: S.dept, images: S.photos.map(p => p.split(",")[1]) }) }); }
   catch (e) { return; } // 401: the setup screen has already been shown
   if (v !== VIEW || !document.getElementById("pmsg")) return;
+  // The photos are saved but the hand-off to the invoice reader failed or wasn't recorded (500/502 with the receipt id):
+  // that delivery exists and is retried automatically, so follow it instead of asking staff to send again.
+  if (!r.ok && r.body && r.body.id && (r.status === 500 || r.status === 502)) {
+    S.receipt = r.body.id; S.uncertain = false; DRAFT = null;   // same as a normal send
+    readingScreen(); return;
+  }
+  // The upload id was already used for a different set of photos (e.g. Back after an uncertain send, then another
+  // supplier). Sending again with the same id fails the same way, so start a fresh id and say what happened.
+  if (r.status === 409) {
+    S.op = newOp(); S.uncertain = false;
+    document.getElementById("pmsg").innerHTML = `<div class="note err">These photos or this supplier changed since the last try, so they will go as a new delivery. Tap Send. If the earlier try arrived, it shows under Recent deliveries — tell Josh so he can remove the extra one.</div>`;
+    const b3 = document.getElementById("send"); if (b3) b3.disabled = !S.photos.length;
+    return;
+  }
   if (!r.ok || !(r.body && r.body.id)) {
     // Not replayed automatically. 503 is rejected before anything is saved; a lost connection or server error may or may not have saved it.
     const sure = r.status === 503 || r.status === 400;
@@ -872,7 +886,9 @@ async function scanBarcode(onRead) {
   ov.innerHTML = `<video id="scanv" style="width:min(92vw,640px);border-radius:12px" playsinline muted></video><div style="color:#fff">Point the camera at the barcode</div><button class="secondary" onclick="stopScan()">Cancel</button>`;
   document.body.appendChild(ov);
   try {
-    if (!ZX) { await new Promise((res, rej) => { const s = document.createElement("script"); s.src = "https://unpkg.com/@zxing/browser@0.1.5/umd/zxing-browser.min.js"; s.onload = res; s.onerror = rej; document.head.appendChild(s); }); ZX = new window.ZXingBrowser.BrowserMultiFormatReader(); }
+    if (!ZX) { await new Promise((res, rej) => { const s = document.createElement("script"); s.src = "https://unpkg.com/@zxing/browser@0.1.5/umd/zxing-browser.min.js";
+      // pinned by hash (28 Nov review): this page can read the device keys, so a changed copy of the script must not run
+      s.integrity = "sha384-ylLhng89kD62+PVK1cjm4rAYg69zDlGrbbSfAE2Eb8Xqf8RoAQCMcRoUXZh7pAPC"; s.crossOrigin = "anonymous"; s.onload = res; s.onerror = rej; document.head.appendChild(s); }); ZX = new window.ZXingBrowser.BrowserMultiFormatReader(); }
     if (!ov.isConnected) return;
     const controls = await ZX.decodeFromVideoDevice(undefined, "scanv", (result, error, ctl) => {
       if (!result || !ov.isConnected) return;

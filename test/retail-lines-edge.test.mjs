@@ -149,3 +149,18 @@ test('wrong methods are 405', async () => {
   assert.equal((await go(rpc, 'POST', '/retail-lines', {})).status, 405);
   assert.equal((await go(rpc, 'GET', '/retail-lines/12/new')).status, 405);
 });
+
+// Review fix (28 Nov 2026): a fractional or missing product id is a definite 400, never sent on to the database
+// (where the cast raised and the reply looked "uncertain", asking staff to retry forever).
+test('existing: a non-whole stock_item_id is refused before any database call', async () => {
+  for (const bad of [745.5, 0, -3, '745', null]) {
+    const { rpc, calls } = rpcStub({ data: { http: 200, body: { ok: true } }, error: null });
+    const out = await go(rpc, 'POST', '/retail-lines/12/existing', { op_id: OP, by: 'Fern', stock_item_id: bad, units: 6 });
+    assert.equal(out.status, 400, String(bad));
+    assert.equal(out.body.code, 'invalid');
+    assert.equal(calls.length, 0);
+  }
+  const { rpc, calls } = rpcStub({ data: { http: 200, body: { ok: true } }, error: null });
+  assert.equal((await go(rpc, 'POST', '/retail-lines/12/existing', { op_id: OP, by: 'Fern', stock_item_id: 745, units: 6 })).status, 200);
+  assert.equal(calls.length, 1);
+});
