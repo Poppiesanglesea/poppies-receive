@@ -102,11 +102,14 @@ async function homeScreen() {
   if (S.photos.length && !S.receipt) DRAFT = { dept: S.dept, supplier: S.supplier, photos: S.photos, op: S.op, uncertain: !!S.uncertain };
   S = { dept: S.dept, supplier: null, photos: [], receipt: null }; WHO = null;
   $(`${DRAFT ? `<div class="note" style="margin:0 0 14px"><b>Unsent photos</b> for ${esc(DRAFT.supplier)} (${DRAFT.photos.length} photo${DRAFT.photos.length === 1 ? "" : "s"})${DRAFT.uncertain ? " — the last send may have arrived; check Recent deliveries below. Sending again won't create a second copy." : "."}
-  <div class="row" style="margin-top:8px"><button class="primary small" onclick="resumeDraft()">Resume</button><button class="secondary small" onclick="discardDraft()">Discard</button></div></div>` : ""}<div id="own"><div id="own-josh"></div><div id="own-needs"></div></div><div class="row" style="margin:0 0 18px"><button class="big" style="width:auto;padding:14px 22px" onclick="pricesScreen()">Shelf prices</button></div><div id="dlv"></div><h2>New delivery</h2><p class="q">Which department is it for?</p>
+  <div class="row" style="margin-top:8px"><button class="primary small" onclick="resumeDraft()">Resume</button><button class="secondary small" onclick="discardDraft()">Discard</button></div></div>` : ""}<div id="own"><div id="own-josh"></div><div id="own-needs"></div></div><div class="row" style="margin:0 0 18px"><button class="big" style="width:auto;padding:14px 22px" onclick="pricesScreen()">Shelf prices</button></div><div id="dlv"></div><div id="retail"></div><h2>New delivery</h2><p class="q">Which department is it for?</p>
   <div class="grid">${DEPTS.map(d=>`<button class="big" onclick="S.dept='${d}';supplierScreen()">${d}</button>`).join("")}</div>
   <h2 style="margin-top:28px">Recent deliveries</h2><p class="muted" style="margin:-8px 0 6px">All retail deliveries from the last 14 days. Tap a <span class="tag">photo</span> one to see its new products and print labels.</p>
   <div class="row" style="margin:0 0 6px">${["All", ...DEPTS].map(d => `<button id="rd-${d.replace(" ","")}" class="secondary small" onclick="RD.dept='${d}';drawRecent()">${d}</button>`).join("")}</div>
   <div class="list" id="recent"><span class="muted">Loading…</span></div><div id="months"></div>`);
+  RETAIL = { cards: [], staff: [] };
+  retailForm = null;
+  loadRetail();
   loadDeliveries();
   RETRY = homeScreen;
   const v = VIEW;
@@ -198,6 +201,150 @@ async function setPrice(id) {
   const res = (r.body && r.body.result) || {};
   m.innerHTML = r.ok ? `<div class="note ok">${esc(res.status === "created" ? "Created in Square." : res.status === "dry_run" ? "Test mode: recorded, not created in Square." : (res.status || "Done"))}</div>` : `<div class="note err">${esc(r.body.error || "Couldn't save")}</div>`;
 }
+let RETAIL = { cards: [], staff: [] }, retailForm = null;
+async function loadRetail() {
+  const v = VIEW, box = document.getElementById("retail");
+  if (!box) return;
+  const r = await api("/retail-lines");
+  if (v !== VIEW) return;
+  if (!r.ok || !Array.isArray(r.body.cards)) {
+    box.innerHTML = r.status === 404 ? "" : loadErr(r, "waiting invoice lines", "loadRetail()");
+    return;
+  }
+  RETAIL = r.body;
+  const cards = RETAIL.cards.filter(c => c.open > 0 || c.lines?.some(l => ["setting_up", "with_josh"].includes(l.status)));
+  box.innerHTML = cards.length ? `<h2>Retail deliveries to finish</h2><div class="grid">${cards.map(c =>
+    `<button class="big" onclick="retailScreen(${ja(c.source_id)})"><b>${esc(c.supplier)}</b> · ${esc(c.department)}<br>${esc(c.invoice_number)} · ${esc(dday(c.invoice_date))}<br>${c.open ? esc(c.open) + " waiting" : "View progress"}</button>`).join("")}</div>` : "";
+  drawRecent();
+}
+const retailStatus = l => l.status_note || ({ done: "Booked to stock", setting_up: "Product setup pending", with_josh: "With Josh" }[l.status] || l.status);
+function retailScreen(sid, message = "") {
+  retailForm = null;
+  const c = RETAIL.cards.find(c => c.source_id === sid);
+  if (!c) return homeScreen();
+  S.delivery = sid;
+  $(`<h2>${esc(c.supplier)} · ${esc(c.invoice_number)}</h2><p>${esc(c.department)} · ${esc(dday(c.invoice_date))}</p>
+    ${message ? `<p class="note">${esc(message)}</p>` : ""}
+    ${c.lines.map(l => `<div class="card"><b>${esc(l.description)}</b><p class="muted">${l.department ? esc(l.department) + " · " : ""}Invoiced quantity ${esc(l.qty)} ${esc(l.unit)}${l.invoice_unit_cost_ex != null ? " · " + money(l.invoice_unit_cost_ex) + " ex GST per invoice unit" : ""}</p>
+      ${l.status === "open" ? `<div class="row">${[["existing","Match existing product"],["new","Set up new product"],["josh","Ask Josh"]].map(([action,label]) => `<button class="secondary" onclick="openRetail(${Number(l.unmatched_id)},'${action}')">${label}</button>`).join("")}</div>` : esc(retailStatus(l))}</div>`).join("")}
+    <button class="secondary" onclick="homeScreen()">Back to deliveries</button>`);
+}
+function retailOptions(rows) {
+  return rows.map(o => `<label style="display:block"><input type="radio" style="width:auto" name="retail-product" value="${Number(o.stock_item_id)}"> ${esc(o.name)}${o.last_count != null ? " · last pack " + esc(o.last_count) : ""}${o.shelf_price != null ? " · shelf " + money(o.shelf_price) : ""}</label>`).join("");
+}
+function openRetail(id, action) {
+  const card = RETAIL.cards.find(c => c.source_id === S.delivery);
+  const line = card?.lines.find(l => l.unmatched_id === id && l.status === "open");
+  if (!line) return homeScreen();
+  const department = line.department || card.department;
+  retailForm = { id, action, card, department, op: newOp(), pending: false, confirm: null, searchSeq: 0 };
+  $(`<h2>${esc(line.description)}</h2><p>${esc(card.supplier)} · ${esc(card.invoice_number)}</p>
+   <form id="retail-form" onsubmit="saveRetail();return false" oninput="clearRetailWarning()">
+   <fieldset id="retail-fields" style="border:0;padding:0">
+   ${action === "existing" ? `<h3>Match existing product</h3><p>This saves the match and pack size for future invoices. It can also book other waiting lines from this supplier with the same description.</p>${retailOptions(line.candidates || [])}
+   <div class="row"><input id="retail-query" placeholder="Search eligible products" aria-label="Search eligible products"><button type="button" class="secondary" onclick="retailSearch()">Search</button></div><div id="retail-results"></div>` : ""}
+   ${action !== "josh" ? `<p><label>How many sellable units came in <b>one</b> invoice unit? <input required type="number" inputmode="numeric" min="1" max="500" step="1" id="retail-units"></label></p>
+   ${line.printed_pack != null ? `<p class="muted">The invoice suggests ${esc(line.printed_pack)}. Check the pack on the bench.</p>` : ""}` : ""}
+   ${action === "new" ? `<p><label>Product name (optional) <input id="retail-name" maxlength="120"></label></p>
+   <label>Barcode on one sellable item <input id="retail-barcode" inputmode="numeric"></label>
+   <button type="button" class="secondary" onclick="scanRetail()">Scan item</button><p class="muted">Use the barcode on the individual product. Leave the carton barcode on the invoice.</p>
+   <label><input id="retail-no-code" type="checkbox" style="width:auto" onchange="toggleRetailBarcode()"> This item has no barcode</label>
+   <p><label>Setup note${department === "Grocer" ? " (required if there’s no barcode)" : " (optional)"} <input id="retail-note"></label></p>
+   ${RETAIL.new_stock_mode === "dry_run" ? '<p class="note">Test mode. This plans the new product without creating it in Square.</p>' : ""}` : ""}
+   ${action === "josh" ? '<p><label>What should Josh check? <input required id="retail-reason" maxlength="300"></label></p>' : ""}
+   <label>Checked by <select required id="retail-by"><option value="">Choose your name</option>${(RETAIL.staff || []).map(n => `<option ${n === WHO ? "selected" : ""}>${esc(n)}</option>`).join("")}</select></label>
+   </fieldset><p id="retail-msg" role="status"></p><div class="row"><button id="retail-save" class="primary" type="submit">${({existing:"Match and book stock",new:"Submit product setup",josh:"Send to Josh"})[action]}</button>
+   <button type="button" class="secondary" onclick="retailScreen(S.delivery)">Back</button></div></form>`);
+}
+const retailEl = name => document.getElementById("retail-" + name);
+function toggleRetailBarcode() {
+  const field = retailEl("barcode");
+  field.disabled = retailEl("no-code").checked;
+  if (field.disabled) field.value = "";
+}
+function scanRetail() {
+  if (retailEl("no-code").checked) return;
+  const form = retailForm;
+  scanBarcode(value => { if (form === retailForm && retailEl("barcode")) { retailEl("barcode").value = value; clearRetailWarning(); } });
+}
+function clearRetailWarning() {
+  if (!retailForm?.confirm) return;
+  retailForm.confirm = null;
+  retailEl("msg").textContent = "";
+  retailEl("save").textContent = "Submit";
+}
+async function retailSearch() {
+  const f = retailForm, seq = ++f.searchSeq, q = retailEl("query").value.trim(), box = retailEl("results");
+  if (q.length < 2) { box.textContent = "Enter at least two characters."; return; }
+  box.textContent = "Searching…";
+  const r = await api(`/retail-lines/${f.id}/search?q=${encodeURIComponent(q)}`);
+  if (f !== retailForm || f.searchSeq !== seq) return;
+  box.innerHTML = !r.ok || !Array.isArray(r.body) ? "Search failed. Try again." : retailOptions(r.body) || "No eligible products found.";
+}
+async function saveRetail() {
+  const f = retailForm;
+  if (!f || f.pending) return;
+  const msg = retailEl("msg"), fields = retailEl("fields"), button = retailEl("save");
+  const val = key => retailEl(key).value.trim();
+  const body = { op_id: f.op, by: val("by") };
+  if (!body.by) { msg.textContent = "Choose who checked this line."; return; }
+  if (f.action === "josh") {
+    body.reason = val("reason");
+    if (!body.reason) { msg.textContent = "Enter what Josh should check."; return; }
+  } else {
+    body.units = Number(val("units"));
+    if (!Number.isInteger(body.units) || body.units < 1 || body.units > 500) { msg.textContent = "Enter a whole number from 1 to 500."; return; }
+    if (f.action === "existing") {
+      body.stock_item_id = Number(document.querySelector('input[name="retail-product"]:checked')?.value);
+      if (!body.stock_item_id) { msg.textContent = "Choose the product you checked."; return; }
+    } else {
+      body.no_barcode = retailEl("no-code").checked;
+      body.barcode = body.no_barcode ? "" : val("barcode");
+      body.name = val("name"); body.note = val("note");
+      if (!body.no_barcode && !body.barcode) { msg.textContent = "Scan the sellable item, or mark that it has no barcode."; return; }
+      if (body.no_barcode && f.department === "Grocer" && !body.note) { msg.textContent = "Explain why this grocery item has no barcode."; return; }
+    }
+    const signature = JSON.stringify(body);
+    body.confirm = f.confirm?.signature === signature ? f.confirm.codes : [];
+  }
+  f.pending = fields.disabled = button.disabled = true;
+  msg.textContent = "Saving…";
+  try {
+    const r = await api(`/retail-lines/${f.id}/${f.action}`, { method: "POST", body: JSON.stringify(body) });
+    if (retailForm !== f || !document.getElementById("retail-form")) return;
+    const b = r.body;
+    if ((r.ok && b.ok || r.status === 409) && b.line?.unmatched_id === f.id) {
+      const index = f.card.lines.findIndex(l => l.unmatched_id === f.id);
+      f.card.lines[index] = b.line;
+      f.card.open = f.card.lines.filter(l => l.status === "open").length;
+      WHO = body.by;
+      // Matching can book other lines with identical wording. Refresh the whole queue before offering another action.
+      const fresh = await api("/retail-lines");
+      if (retailForm !== f || !document.getElementById("retail-form")) return;
+      const result = r.ok ? retailStatus(b.line) : b.error || "This line was already answered.";
+      if (!fresh.ok || !Array.isArray(fresh.body.cards)) {
+        retailForm = null;
+        $(`<h2>${esc(result)}</h2><p>Reopen deliveries to load the latest waiting lines.</p><button class="primary" onclick="homeScreen()">Back to deliveries</button>`);
+        return;
+      }
+      RETAIL = fresh.body;
+      if (RETAIL.cards.some(c => c.source_id === f.card.source_id)) retailScreen(f.card.source_id, result);
+      else { retailForm = null; $(`<h2>${esc(result)}</h2><button class="primary" onclick="homeScreen()">Back to deliveries</button>`); }
+      return;
+    }
+    if (b.code === "needs_confirm" && b.checks?.length && b.checks.every(c => c.soft === true)) {
+      const { confirm, ...input } = body;
+      f.confirm = { signature: JSON.stringify(input), codes: [...new Set([...confirm,...b.checks.map(c => c.code)])] };
+      msg.textContent = b.checks.map(c => c.message).join(" ");
+      button.textContent = "I checked — confirm and submit";
+    } else {
+      f.confirm = null;
+      msg.textContent = b.error || "Couldn’t verify the result. Retry or reopen the delivery to check.";
+      button.textContent = "Try again";
+    }
+  } finally { f.pending = fields.disabled = button.disabled = false; }
+}
+
 // ---------- recent deliveries (all retail; last 14 days in full, older months folded)
 let RD = { dept: "All", recent: [], months: [], open: {}, photos: {}, err: false };
 const dayFmt = (d) => new Date(d + "T00:00:00").toLocaleDateString("en-AU", { weekday: "short", day: "numeric", month: "short" });
@@ -209,7 +356,9 @@ function rdRow(x) {
     ? `<span class="tag">photo</span> ${esc(p ? label(p) : "set-up")}`
     : `${x.invoice_number ? "#" + esc(x.invoice_number) + " · " : ""}${x.lines} line${x.lines === 1 ? "" : "s"}${x.booked != null && x.booked < x.lines ? ` · ${x.booked} booked` : ""}${x.waiting ? ` · <b style="color:var(--warn)">${x.waiting} waiting</b>` : ""}${x.open_jobs ? ` · <b style="color:var(--warn)">${x.open_jobs} job${x.open_jobs === 1 ? "" : "s"} open</b>` : ""}`;
   const tap = x.kind === "photo" && p && p.status === "submitted" ? ` onclick="itemsScreen(${ja(x.id)})" style="cursor:pointer"` : "";
-  return `<div${tap}><span>${esc(x.supplier || "Unknown supplier")} <span class="muted">· ${esc((x.depts || []).join(", "))}</span></span><span class="muted" style="text-align:right">${what} · ${dayFmt(x.date)}</span></div>`;
+  const waiting = x.kind === "invoice" && RETAIL.cards.some(c => c.source_id === x.id && c.open > 0);
+  const review = waiting ? ` <button class="secondary small" onclick="retailScreen(${ja(x.id)})">Review waiting lines</button>` : "";
+  return `<div${tap}><span>${esc(x.supplier || "Unknown supplier")} <span class="muted">· ${esc((x.depts || []).join(", "))}</span></span><span class="muted" style="text-align:right">${what} · ${dayFmt(x.date)}${review}</span></div>`;
 }
 function drawRecent() {
   if (!document.getElementById("recent") || !document.getElementById("months")) return;
@@ -659,16 +808,25 @@ function groupProblems(lines){
 
 // ---------- barcode scanner (camera)
 let ZX = null, scanCtl = null;
-async function scanFor(i) {
+function scanFor(i) {
+  return scanBarcode(value => { LINES[i].barcode = value; drawLines(); });
+}
+async function scanBarcode(onRead) {
   const ov = document.createElement("div");
   ov.id = "scanov"; ov.style.cssText = "position:fixed;inset:0;background:#000d;z-index:9;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px";
   ov.innerHTML = `<video id="scanv" style="width:min(92vw,640px);border-radius:12px" playsinline muted></video><div style="color:#fff">Point the camera at the barcode</div><button class="secondary" onclick="stopScan()">Cancel</button>`;
   document.body.appendChild(ov);
   try {
     if (!ZX) { await new Promise((res, rej) => { const s = document.createElement("script"); s.src = "https://unpkg.com/@zxing/browser@0.1.5/umd/zxing-browser.min.js"; s.onload = res; s.onerror = rej; document.head.appendChild(s); }); ZX = new window.ZXingBrowser.BrowserMultiFormatReader(); }
-    scanCtl = await ZX.decodeFromVideoDevice(undefined, "scanv", (result) => {
-      if (result) { LINES[i].barcode = result.getText(); stopScan(); drawLines(); }
+    if (!ov.isConnected) return;
+    const controls = await ZX.decodeFromVideoDevice(undefined, "scanv", (result, error, ctl) => {
+      if (!result || !ov.isConnected) return;
+      ctl.stop();
+      stopScan();
+      onRead(result.getText());
     });
+    if (ov.isConnected) scanCtl = controls;
+    else controls.stop();
   } catch (e) { ov.querySelector("div").textContent = "Camera not available — type the barcode numbers instead."; }
 }
 function stopScan(){ try { scanCtl && scanCtl.stop(); } catch(e){} scanCtl = null; const o = document.getElementById("scanov"); if (o) o.remove(); }
