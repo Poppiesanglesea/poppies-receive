@@ -3,13 +3,19 @@
 | File | Status |
 |---|---|
 | `migrations/20261126_provenance_01_function_backup.sql` | Applied 26 Nov 2026 |
-| `migrations/20261126_provenance_02_schema.sql` (rev 2) | **Staged, not applied** — validated locally |
+| `migrations/20261126_provenance_02_schema.sql` (rev 2) | **Staged, not applied** — validated locally. Original approval declined (Codex handover, 26 Nov) |
 | `rollback/20261126_provenance_02_schema_rollback.sql` | Validated locally (refuses if tables used / exceptions reviewed) |
-| `migrations/20261126_pricing_03_tag_confirm.sql` (rev 2) | **Staged, not applied** — validated locally |
-| `rollback/20261126_pricing_03_tag_confirm_rollback.sql` | Validated locally (refuses while a register update is in flight or in doubt; keeps audit + operation evidence) |
+| `migrations/20261126_pricing_03_tag_confirm.sql` (rev 2) | **Applied 26 Nov 2026** (~22:31 Melbourne, via Supabase apply_migration; post-apply `delivery_app_selfcheck` ok, all 16 function bodies matched e0e8301 — Codex handover record) |
+| `rollback/20261126_pricing_03_tag_confirm_rollback.sql` | Validated locally (refuses while a register update is in flight or in doubt; keeps audit + operation evidence). **Order:** refuses while pricing_repair_01 is applied (run its rollback first) or while `produce_price_items` carries the 28 Nov markup decision |
+| `migrations/20261128_produce_markup_no_decision.sql` | **Applied 28 Nov 2026** directly in production (Josh: produce prices that needed his decision now just take the markup, produce only; the >max-% owner hold no longer applies to produce). Recorded afterwards; keeps the previous version as `produce_price_items_bak_20261128`. Do not re-run: a second run overwrites that backup with the new version |
+| `migrations/20261128_pricing_repair_01.sql` | **Staged, not applied** — its guard expects the markup version of `produce_price_items` above. Tests: `tests/run_pricing_repair_local.sh` |
+| `rollback/20261128_pricing_repair_01_rollback.sql` | Validated locally (refuses unless every replaced object still carries the repair marker) |
 | `migrations/20261128_retail_lines_01.sql` | **Staged, not applied** — retail waiting-line jobs (contract: docs/retail-lines-contract.md). Rev 2. Tested rolled back on live data 28 Nov 2026: `tests/retail_lines_pre.sql` + migration + `tests/retail_lines_rollback_test.sql` 82/82, residue check clean (`tests/retail_lines_residue_check.sql`) |
 | `rollback/20261128_retail_lines_01_rollback.sql` | Validated locally (refuses while a set-up is in flight or if the patched functions changed since; archives answer tables) |
 | `tests/run_local.sh` | Reproducible local run of everything below (disposable PostgreSQL 16+ with dblink) |
+
+Statuses updated 28 Nov 2026 from the Codex handover records and the markup branch, not re-read from the live database.
+Confirm with `select delivery_app_selfcheck();` and `select distinct label from function_backup;` before relying on them.
 
 Applied directly (narrowing / read-only, before or alongside this folder): app RPC privilege narrowing,
 `delivery_app_selfcheck()` (now also flags SECURITY DEFINER pricing functions callable by anon/authenticated and lists
