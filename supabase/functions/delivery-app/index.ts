@@ -19,7 +19,7 @@
 //   check every storage/row write, and re-dispatch a lost or failed reader hand-off from the stored PDF (receipts.ts).
 //   Shelf-tag confirm uses delivery_tag_claim then delivery_tag_apply as two calls when the database has them
 //   (staged pricing_03); before that it falls back to the single delivery_task_tick call.
-// v18 (28 Nov 2026): retail waiting lines (retail.ts; contract docs/retail-lines-contract.md): GET /retail-lines,
+// v19 (28 Nov 2026; the unmerged known-barcodes branch is "v18 2026-11-27"): retail waiting lines (retail.ts; contract docs/retail-lines-contract.md): GET /retail-lines,
 //   GET /retail-lines/:id/search, POST /retail-lines/:id/(existing|new|josh). "new" hands the line to new-stock-setup.
 //   Rev 2: browsing is read-only (no sweep, no requeue); POST /owner/retail-lines/:id/promote (owner key) approves a
 //   product planned while set-up was in test mode. /recent lists only photo receipts (origin = 'photo').
@@ -32,9 +32,9 @@ import { createReceipt, reconcileReceipt, type Deps, type Receipt } from "./rece
 import { confirmTag, type RpcErr } from "./tags.ts";
 import { retailOwnerRoute, retailRoute } from "./retail.ts";
 
-export const BUILD = "delivery-app v18 2026-11-28";
+export const BUILD = "delivery-app v19 2026-11-28 retail-lines";
 // SOURCE_SHA is written by scripts/check-edge.mjs --write: sha-256 of index.ts (with this one line removed), auth.ts, receipts.ts, tags.ts and retail.ts.
-export const SOURCE_SHA = { index: "5005d224189c2acdb93b5831c4c4b709a2095d2e3fd577a3abcd6ee29a7f7c29", auth: "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331", receipts: "0bbd4a7723ef2f7b146ac729ab08c45034a4d6dd04fecb3ef6c1adf72f199afe", tags: "0866c0de5065b546c54c8211853388e3316ec5fa4d297f70f12f30c2ed340c3d", retail: "ba5b57337b58cc61ffd90daf4586f78be1f510168961cd21505e40e9362b6ff8" };
+export const SOURCE_SHA = { index: "81f76bfde5ea97551ad87cb78279ebc2167ff2c072bff432c65841103ebb9a91", auth: "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331", receipts: "0bbd4a7723ef2f7b146ac729ab08c45034a4d6dd04fecb3ef6c1adf72f199afe", tags: "0866c0de5065b546c54c8211853388e3316ec5fa4d297f70f12f30c2ed340c3d", retail: "ba5b57337b58cc61ffd90daf4586f78be1f510168961cd21505e40e9362b6ff8" };
 
 const URL_ = Deno.env.get("SUPABASE_URL")!;
 const SB = createClient(URL_, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);

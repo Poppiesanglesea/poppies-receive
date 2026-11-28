@@ -1,14 +1,14 @@
 {
-  "build": "delivery-app v18 2026-11-28",
+  "build": "delivery-app v19 2026-11-28 retail-lines",
   "source_sha": {
-    "index": "5005d224189c2acdb93b5831c4c4b709a2095d2e3fd577a3abcd6ee29a7f7c29",
+    "index": "81f76bfde5ea97551ad87cb78279ebc2167ff2c072bff432c65841103ebb9a91",
     "auth": "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331",
     "receipts": "0bbd4a7723ef2f7b146ac729ab08c45034a4d6dd04fecb3ef6c1adf72f199afe",
     "tags": "0866c0de5065b546c54c8211853388e3316ec5fa4d297f70f12f30c2ed340c3d",
     "retail": "ba5b57337b58cc61ffd90daf4586f78be1f510168961cd21505e40e9362b6ff8"
   },
   "file_sha256": {
-    "index.ts": "31d2e5d8da4ace9106483e6394dbdbe6391a73ff1e64f2477d778a464c1c5595",
+    "index.ts": "a50f0475e963a7616fc42e7bff4233129fca45ec8ad15b70100a893e41f63662",
     "auth.ts": "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331",
     "receipts.ts": "0bbd4a7723ef2f7b146ac729ab08c45034a4d6dd04fecb3ef6c1adf72f199afe",
     "tags.ts": "0866c0de5065b546c54c8211853388e3316ec5fa4d297f70f12f30c2ed340c3d",

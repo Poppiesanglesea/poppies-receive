@@ -1,8 +1,19 @@
-# Retail waiting lines — API contract (draft 2, 28 Nov 2026)
+# Retail waiting lines — API contract (draft 3, 28 Nov 2026)
 
 Owner of backend: Claude (branch `retail-waiting-lines-2026-11-28`). Frontend: Codex (separate branch).
 Status: **staged; nothing deployed or applied.** Backend implemented on this branch and tested rolled back on live data
 (db/tests/retail_lines_rollback_test.sql: 64/64). Frontend: PR #5.
+
+Changes in draft 3 (Codex review of draft 2):
+- **Uncertain replies:** a transport error or thrown call now returns **503 `code: "uncertain"`, `retry: true`** (was 500
+  `retry`): the save may or may not have happened; re-send the same `op_id` and body, which replays the stored result.
+- **Read-only browsing:** `GET /retail-lines` and search never write (the list function is STABLE; the Edge no longer
+  sweeps on GET).
+- **Test-mode plans:** a "new" answered while new-stock set-up is in test mode stays a plan. When set-up goes live it
+  is shown `with_josh` with `needs_promotion: true` and is created only after Josh approves it:
+  `POST /owner/retail-lines/:unmatched_id/promote` (owner key).
+- **Departments:** each line has `department`; each card has `departments` (array) and `department` (null when mixed).
+  Use the line's department for the Grocer barcode rule.
 
 Changes since draft 1 (all additive, PR #5 needs no change): option field `barcode_match`; 400 code `booking_failed`;
 500 `code: "retry"`; `receipt_id` on "new" success; `product` on `barcode_known`; exclusions listed under "Which cards".
@@ -44,10 +55,13 @@ Lines that already have a produce `count` job (Harvey's/Biodynamic) are excluded
   "cards": [{
     "source_id": "drive-file-id",
     "supplier": "Supplier A", "invoice_number": "INV-1", "invoice_date": "2026-11-25",
-    "department": "Grocer",              // Grocer | Gift Store | Garden
+    "department": "Grocer",              // the card's department, or null when its lines are in more than one
+    "departments": ["Grocer"],           // every department on this card
     "open": 2,                           // lines with status "open"
     "lines": [{
       "unmatched_id": 2046,              // the job id used in every route below
+      "department": "Grocer",            // this line's department (use it for the Grocer barcode rule)
+      "needs_promotion": false,          // true: planned in test mode, set-up now live, waiting for Josh's approval
       "description": "Brand Product 135g (10)",  // as printed on the invoice
       "qty": 1, "unit": null,            // invoiced quantity and unit (unit often null = each/carton as printed)
       "invoice_unit_cost_ex": 136.10,    // ex-GST price of ONE invoice unit (may be null)
@@ -85,7 +99,8 @@ Order: invoice_date desc, then supplier. Lines in invoice order.
 Status meaning:
 - `open`: needs a staff action.
 - `setting_up`: "new" chosen; product set-up running (or planned only, in `dry_run`).
-- `with_josh`: "josh" chosen, or set-up could not finish without Josh (price/category/SKU question, Square refusal).
+- `with_josh`: "josh" chosen, or set-up could not finish without Josh (price/category/SKU question, Square refusal), or
+  a test-mode plan waiting for Josh's approval (`needs_promotion: true`).
 - `done`: the line is booked to stock (by this app or outside it).
 
 ## GET /retail-lines/:unmatched_id/search?q=
@@ -128,7 +143,18 @@ barcode or SKU, and sends a line the reader thinks is an existing product to Jos
     `carton_barcode`, `barcode_known`, `barcode_required`.
 - 404 `{ "ok": false, "code": "not_found" }` — not a retail waiting line (or a produce line handled on /deliveries).
 - 409 `{ "ok": false, "code": "op_conflict" | "already_answered", "error", "line" }`
-- 500 `{ "ok": false, "code": "retry", "error" }` — the database did not commit; re-send the same `op_id`. 503 as today.
+- 503 `{ "ok": false, "code": "uncertain", "retry": true, "error" }` — no confirmed reply from the database; the save
+  may have happened. Re-send the same `op_id` and body (never a new `op_id`): it replays or completes, never doubles.
+- 503 without `code` (settings unavailable) as today.
+
+## POST /owner/retail-lines/:unmatched_id/promote   (owner key only)
+```json
+{ "op_id": "uuid" }
+```
+Approves creating a product that staff planned while set-up was in test mode. 200 → `{ ok, status: "setting_up",
+receipt_id, line }` and the Edge hands the receipt to set-up. 409 `setup_test_mode` while set-up is still in test
+mode; 409 `already_answered` if already approved (same `op_id` → 200 `replayed`) or the line is booked; 404 if the line
+has no test-mode plan; 503 `uncertain` as above.
 
 ## Checks
 Sale unit versus carton is the main risk: an invoice unit is usually a carton (the "(10)" in the description) and the
