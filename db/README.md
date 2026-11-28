@@ -7,6 +7,8 @@
 | `rollback/20261126_provenance_02_schema_rollback.sql` | Validated locally (refuses if tables used / exceptions reviewed) |
 | `migrations/20261126_pricing_03_tag_confirm.sql` (rev 2) | **Staged, not applied** — validated locally |
 | `rollback/20261126_pricing_03_tag_confirm_rollback.sql` | Validated locally (refuses while a register update is in flight or in doubt; keeps audit + operation evidence) |
+| `migrations/20261128_retail_lines_01.sql` | **Staged, not applied** — retail waiting-line jobs (contract: docs/retail-lines-contract.md). Rev 2. Tested rolled back on live data 28 Nov 2026: `tests/retail_lines_pre.sql` + migration + `tests/retail_lines_rollback_test.sql` 82/82, residue check clean (`tests/retail_lines_residue_check.sql`) |
+| `rollback/20261128_retail_lines_01_rollback.sql` | Validated locally (refuses while a set-up is in flight or if the patched functions changed since; archives answer tables) |
 | `tests/run_local.sh` | Reproducible local run of everything below (disposable PostgreSQL 16+ with dblink) |
 
 Applied directly (narrowing / read-only, before or alongside this folder): app RPC privilege narrowing,
