@@ -201,3 +201,25 @@ test('failed produce product search asks staff to retry', async () => {
   assert.match(a.el('cs2').innerHTML,/try again/i);
   assert.doesNotMatch(a.el('cs2').innerHTML,/nothing found/i);
 });
+
+// Review fix (28 Nov 2026): an empty or unreadable "Other price" box must never approve the worked-out price.
+test('Set with an empty Other price box sends nothing and asks for a price', async () => {
+  const a = app({ owner: true });
+  await a.run('joshScreen()');
+  a.el('p3').value = '';
+  await a.run('decideTyped(3)');
+  assert.equal(a.requests.filter(r => r.url.endsWith('/owner/tasks/3/decide')).length, 0);
+  assert.match(a.el('app').innerHTML, /Type the new price first/);
+  a.el('p3').value = '1,50';
+  await a.run('decideTyped(3)');
+  assert.equal(a.requests.filter(r => r.url.endsWith('/owner/tasks/3/decide')).length, 0);
+});
+
+test('Set sends the typed price as a number', async () => {
+  const a = app({ owner: true });
+  await a.run('joshScreen()');
+  a.el('p3').value = '$ 9.50';
+  await a.run('decideTyped(3)');
+  const d = a.requests.find(r => r.url.endsWith('/owner/tasks/3/decide'));
+  assert.deepEqual(d.body, { decision: 'approve', price: 9.5 });
+});
