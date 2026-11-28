@@ -72,3 +72,12 @@ test('grocery without a barcode requires a reason and hard rejections cannot be 
   assert.match(a.el('retail-msg').textContent,/Invalid barcode/);
   assert.equal(a.run('retailForm.confirm'),null);
 });
+
+test('a Grocer line on a mixed invoice requires an explanation for a missing barcode', async () => {
+  const a = setup('new');
+  a.run('card.department = "Garden"; card.lines[0].department = "Grocer"; openRetail(12, "new")');
+  a.el('retail-no-code').checked = true;
+  await a.run('saveRetail()');
+  assert.match(a.el('retail-msg').textContent, /Explain why/);
+  assert.equal(a.posts.length, 0);
+});
