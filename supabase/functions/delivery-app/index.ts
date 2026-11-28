@@ -19,6 +19,9 @@
 //   check every storage/row write, and re-dispatch a lost or failed reader hand-off from the stored PDF (receipts.ts).
 //   Shelf-tag confirm uses delivery_tag_claim then delivery_tag_apply as two calls when the database has them
 //   (staged pricing_03); before that it falls back to the single delivery_task_tick call.
+// v18 (28 Nov 2026): retail waiting lines (retail.ts; contract docs/retail-lines-contract.md): GET /retail-lines,
+//   GET /retail-lines/:id/search, POST /retail-lines/:id/(existing|new|josh). "new" hands the line to new-stock-setup.
+//   /recent lists only photo receipts (origin = 'photo').
 // v16 (26 Nov 2026): POST /receipts accepts a client op_id (uuid) and uses it as the receipt id, so re-sending the same
 //   photo set after an uncertain failure returns the existing receipt instead of creating a duplicate delivery.
 import { createClient } from "jsr:@supabase/supabase-js@2";
@@ -26,10 +29,11 @@ import { PDFDocument } from "npm:pdf-lib@1.17.1";
 import { ConfigUnavailable, makeCfg, whoFromHeaders } from "./auth.ts";
 import { createReceipt, reconcileReceipt, type Deps, type Receipt } from "./receipts.ts";
 import { confirmTag, type RpcErr } from "./tags.ts";
+import { retailRoute } from "./retail.ts";
 
-export const BUILD = "delivery-app v17 2026-11-26";
-// SOURCE_SHA is written by scripts/check-edge.mjs --write: sha-256 of index.ts (with this one line removed), auth.ts, receipts.ts and tags.ts.
-export const SOURCE_SHA = { index: "ff22b83043c1d59df609af878380b271677834693922bf26c193761007d3c997", auth: "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331", receipts: "0bbd4a7723ef2f7b146ac729ab08c45034a4d6dd04fecb3ef6c1adf72f199afe", tags: "0866c0de5065b546c54c8211853388e3316ec5fa4d297f70f12f30c2ed340c3d" };
+export const BUILD = "delivery-app v18 2026-11-28";
+// SOURCE_SHA is written by scripts/check-edge.mjs --write: sha-256 of index.ts (with this one line removed), auth.ts, receipts.ts, tags.ts and retail.ts.
+export const SOURCE_SHA = { index: "dd6a2d99ca028973fc5ae3978bd7cc3718254ba4a6301b2e445a61f2a9cc4bc5", auth: "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331", receipts: "0bbd4a7723ef2f7b146ac729ab08c45034a4d6dd04fecb3ef6c1adf72f199afe", tags: "0866c0de5065b546c54c8211853388e3316ec5fa4d297f70f12f30c2ed340c3d", retail: "6b4a98fa3b7c8f59224dada4ee9559803c2d9d99348415576fe17902382517a6" };
 
 const URL_ = Deno.env.get("SUPABASE_URL")!;
 const SB = createClient(URL_, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
@@ -203,6 +207,22 @@ Deno.serve(async (req) => {
       return json({ error: "not found" }, 404);
     }
 
+    // ---- Retail waiting lines (v18)
+    if (path.startsWith("/retail-lines")) {
+      const staff = async () => (await cfg("delivery_staff_names")).split(",").map((n) => n.trim()).filter(Boolean);
+      // deno-lint-ignore no-explicit-any
+      const out = await retailRoute((fn, args) => SB.rpc(fn, args) as unknown as Promise<{ data: any; error: RpcErr }>,
+        req.method, path, new URL(req.url), () => req.json(), staff, w.owner);
+      if (out) {
+        const b = out.body as { receipt_id?: string; status?: string } | null;
+        if (out.status === 200 && b?.receipt_id && b.status === "setting_up") {
+          // deno-lint-ignore no-explicit-any
+          (globalThis as any).EdgeRuntime.waitUntil(setup({ receipt_id: b.receipt_id }).catch(() => null));  // the sweep retries a lost hand-off
+        }
+        if (req.method === "GET" && path === "/retail-lines") sweepSoon();
+        return json(out.body, out.status);
+      }
+    }
     // ---- Recent retail deliveries (v13): last 14 days + older months folded; ?month=YYYY-MM opens one month
     if (req.method === "GET" && path === "/recent-deliveries") {
       const mo = new URL(req.url).searchParams.get("month");
@@ -359,7 +379,7 @@ Deno.serve(async (req) => {
 
     if (req.method === "GET" && path === "/recent") {
       sweepSoon();
-      const { data, error } = await SB.from("delivery_receipts").select("id, supplier, department, status, setup_status, created_at").eq("is_fixture", false).neq("status", "cancelled").order("created_at", { ascending: false }).limit(20);
+      const { data, error } = await SB.from("delivery_receipts").select("id, supplier, department, status, setup_status, created_at").eq("is_fixture", false).eq("origin", "photo").neq("status", "cancelled").order("created_at", { ascending: false }).limit(20);
       if (error) return json({ error: "Couldn't load recent deliveries." }, 500);
       const ids = (data ?? []).filter((r) => r.setup_status === "ready").map((r) => r.id);
       const { data: aw, error: awErr } = ids.length ? await SB.from("v_new_stock_awaiting_price").select("receipt_id").in("receipt_id", ids) : { data: [], error: null };

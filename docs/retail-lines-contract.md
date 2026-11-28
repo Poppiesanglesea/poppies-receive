@@ -1,7 +1,11 @@
-# Retail waiting lines — API contract (draft 1, 28 Nov 2026)
+# Retail waiting lines — API contract (draft 2, 28 Nov 2026)
 
 Owner of backend: Claude (branch `retail-waiting-lines-2026-11-28`). Frontend: Codex (separate branch).
-Status: **contract draft, staged; nothing deployed or applied.** Changes to this file are announced in the handover.
+Status: **staged; nothing deployed or applied.** Backend implemented on this branch and tested rolled back on live data
+(db/tests/retail_lines_rollback_test.sql: 64/64). Frontend: PR #5.
+
+Changes since draft 1 (all additive, PR #5 needs no change): option field `barcode_match`; 400 code `booking_failed`;
+500 `code: "retry"`; `receipt_id` on "new" success; `product` on `barcode_known`; exclusions listed under "Which cards".
 
 ## What it covers
 An emailed invoice for Grocer, Gift Store or Garden is booked line by line. A line the system cannot match to a
@@ -62,7 +66,8 @@ Option (candidates and search results):
 { "stock_item_id": 745, "name": "Brand - Product – Variation", "count_unit": "each",
   "supplied_by_this_supplier": true, "last_count": 6,       // units per invoice unit last time from this supplier, or null
   "unit_cost_ex": 8.00,                                      // last known cost of ONE sellable unit, ex GST, or null
-  "shelf_price": 13.50 }                                     // current shelf price (inc GST), or null
+  "shelf_price": 13.50,                                      // current shelf price (inc GST), or null
+  "barcode_match": true }                                    // the invoice's carton code contains this product's barcode
 ```
 Answer:
 ```jsonc
@@ -71,7 +76,10 @@ Answer:
   "reason": "…", "confirmed": ["printed_pack_differs"] }
 ```
 Which cards: invoices dated in the last 30 days with at least one retail waiting line, plus lines answered or booked
-in the last 48 hours (shown `done` / `setting_up` / `with_josh`). Test and duplicate invoices are excluded.
+in the last 48 hours (shown `done` / `setting_up` / `with_josh`). Excluded: test and duplicate invoices; lines with no
+quantity; lines parked as "[UNRESOLVED UNIT]" (a mapping exists, only the unit is unknown — Josh's invoice-mapping
+work); lines of suppliers handled by the produce pricing run (they stay on /deliveries).
+Candidates: up to 10, carton-barcode matches first, then products this supplier already supplies, then by name.
 Order: invoice_date desc, then supplier. Lines in invoice order.
 
 Status meaning:
@@ -89,7 +97,9 @@ waiting line.
 { "op_id": "uuid", "by": "Fern", "stock_item_id": 745, "units": 6, "confirm": [] }
 ```
 `units`: sellable units in ONE invoice unit, integer 1–500. On success books the line (and any other open line of the
-same supplier with the identical description), saves the mapping with that pack, returns status `done`.
+same supplier with the identical description, on any invoice), saves the mapping with that pack, returns status `done`.
+If the line does not book, everything is undone and the reply is 400 `booking_failed` (nothing recorded; the same
+`op_id` may be re-sent, or the line sent to Josh).
 
 ## POST /retail-lines/:unmatched_id/new
 ```json
@@ -99,7 +109,10 @@ same supplier with the identical description), saves the mapping with that pack,
 - `barcode`: digits from scanning ONE sellable item (EAN-8, UPC-A 12, EAN-13; GTIN-14 accepted only with indicator 0).
 - `no_barcode: true` when the item really has none (Gift Store/Garden usually; Grocer must explain in `note`).
 - `name` optional (≤120); the set-up names the product from the invoice in house style.
-Returns status `setting_up` (or `with_josh` if set-up already resolved that way on a replay).
+Returns status `setting_up` (or `with_josh` if set-up already resolved that way on a replay) and `receipt_id`.
+The Edge function hands the receipt to new-stock-setup straight away; the existing sweep retries a lost hand-off.
+Set-up uses the staff count and the invoice's ex-GST price for the unit cost, never uses the carton code as the shelf
+barcode or SKU, and sends a line the reader thinks is an existing product to Josh instead of mapping it.
 
 ## POST /retail-lines/:unmatched_id/josh
 ```json
@@ -115,7 +128,7 @@ Returns status `setting_up` (or `with_josh` if set-up already resolved that way 
     `carton_barcode`, `barcode_known`, `barcode_required`.
 - 404 `{ "ok": false, "code": "not_found" }` — not a retail waiting line (or a produce line handled on /deliveries).
 - 409 `{ "ok": false, "code": "op_conflict" | "already_answered", "error", "line" }`
-- 500 `{ "error" }`; 503 as today (settings unavailable, retry).
+- 500 `{ "ok": false, "code": "retry", "error" }` — the database did not commit; re-send the same `op_id`. 503 as today.
 
 ## Checks
 Sale unit versus carton is the main risk: an invoice unit is usually a carton (the "(10)" in the description) and the
@@ -131,8 +144,9 @@ code printed on the invoice is usually the carton barcode.
 | `cost_differs` | soft | existing | invoice_unit_cost_ex / units outside 0.5×–2× the product's last unit cost |
 | `barcode_invalid` | hard | new | not 8/12/13/14 digits or GS1 check digit wrong |
 | `carton_barcode` | hard | new | barcode equals the invoice's carton code, or is a GTIN-14 with indicator 1–8 |
-| `barcode_known` | hard | new | barcode already on an active Square product (message names it: use "existing") |
+| `barcode_known` | hard | new | barcode already on an active Square product (`product` names it: use "existing") |
 | `barcode_required` | hard | new | Grocer, no barcode, `no_barcode` not true or no `note` |
+| `booking_failed` | hard | existing | the mapping did not book this line; all of it was undone |
 
 ## Not in this packet
 - Josh's screen for `with_josh` lines from action "josh" (he sorts them in a Claude chat for now; set-up questions
