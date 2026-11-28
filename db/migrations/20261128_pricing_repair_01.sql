@@ -5,23 +5,28 @@
 -- Rollback: db/rollback/20261128_pricing_repair_01_rollback.sql
 --
 -- What it changes
---  1. Exact pack arithmetic. New retail_price_for_pack(pack_cost, pack_size, base, category, taxable): cost x markup
---     (x 1.10 if taxable) rounded UP to 5c in exact integer arithmetic, from the unrounded pack cost. Used by
---     v_price_rule_candidates (band method; whole items) and sync_part_variation_prices (halves/quarters). Before, the
---     cost per unit was rounded to 4 dp (or carried a repeating decimal) before the markup, so a price that lands exactly
---     on a 5c step came out 5c high (e.g. 12 for $14.00 -> $2.15, should be $2.10). Passthrough pricing and
---     round_up_5c are unchanged.
+--  1. Exact pack arithmetic, PRODUCE ONLY. New retail_price_for_pack(pack_cost, pack_size, base, category, taxable):
+--     cost x markup (x 1.10 if taxable) rounded UP to 5c in exact integer arithmetic, from the unrounded pack cost. Used
+--     for retail_category = 'Produce' (stock-item overrides included) in v_price_rule_candidates (band method; whole
+--     items) and sync_part_variation_prices (halves/quarters). Before, the cost per unit was rounded to 4 dp (or carried
+--     a repeating decimal) before the markup, so a price that lands exactly on a 5c step came out 5c high (e.g. 12 for
+--     $14.00 -> $2.15, should be $2.10). Every other category keeps its original expression unchanged; passthrough
+--     pricing and round_up_5c are unchanged.
 --  2. A missing Square variation stays with its item. produce_price_items lists it under "failed" (dry run too) instead
 --     of reaching price_propose, which raised and aborted the whole invoice; any other per-item error is caught in a
 --     sub-transaction and listed under "failed". price_rules_scan gets the same NULL-safe check.
 --  3. The produce queue isolates failures. produce_price_sweep prices each invoice in its own sub-transaction. A failure
 --     is recorded in produce_price_attempts and retried with back-off (5 min, doubling, capped at 6 h; parked after 8
 --     tries). Invoices never tried are always taken first, so failing invoices cannot starve later deliveries.
---  4. Out-of-date approvals are refused at the entry points that approve or apply them:
+--  4. Out-of-date approvals are refused at the entry points that approve or apply them, for items whose CURRENT
+--     retail_category is 'Produce' (stock-item overrides included). Every other category keeps its original decide /
+--     apply / owner-screen behaviour unchanged:
 --       * price_proposal_decide(ids, 'approved')  - a pending proposal whose shelf price or calculated price has moved is
 --         withdrawn (superseded) and, if a change is still due and no delivery tag job is open, re-queued as a fresh
 --         pending proposal. The result lists them under "stale".
 --       * price_proposal_apply(...)               - an approved proposal that is now out of date is skipped, never applied.
+--         (All categories: after taking the item lock the apply loop re-reads the proposal and skips it unless it is still
+--         'approved', so a concurrent decision or apply is never overwritten.)
 --       * delivery_price_decide (app owner screen, via delivery_owner_decide) - accepting a job's suggested price is
 --         refused if the shelf price or the calculation has moved; the job is refreshed with the current figures.
 --         A price Josh types himself is still accepted.
@@ -98,7 +103,7 @@ begin
     'cur.pack_cost, cur.pack_grams AS pack_size, round(((cur.pack_cost / NULLIF(cur.pack_grams, (0)::numeric)) * COALESCE(sm.retail_units_base, si.grams_per_count_unit)), 4) AS new_cost,');
   v := pg_temp.patch(v,
     'WHEN ''band''::text THEN retail_price_for(b.new_cost, b.retail_category, b.taxable)',
-    'WHEN ''band''::text THEN retail_price_for_pack(b.pack_cost, b.pack_size, b.retail_unit_base, b.retail_category, b.taxable)');
+    'WHEN ''band''::text THEN CASE WHEN b.retail_category = ''Produce''::text THEN retail_price_for_pack(b.pack_cost, b.pack_size, b.retail_unit_base, b.retail_category, b.taxable) ELSE retail_price_for(b.new_cost, b.retail_category, b.taxable) END');
   execute 'CREATE OR REPLACE VIEW public.v_price_rule_candidates AS ' || v;
 end $v$;
 
@@ -106,9 +111,11 @@ do $s$
 declare f text := pg_get_functiondef('public.sync_part_variation_prices(bigint,boolean)'::regprocedure);
 begin
   f := pg_temp.patch(f, E'whenever the parent moves.\n',
-         E'whenever the parent moves.\n-- pricing-repair-2026-11-28: exact pack arithmetic (retail_price_for_pack), no 4-dp cost rounding.\n');
+         E'whenever the parent moves.\n-- pricing-repair-2026-11-28: Produce uses exact pack arithmetic (retail_price_for_pack); other categories unchanged.\n');
   f := pg_temp.patch(f, E'retail_price_for(round(c.pack_cost / nullif(c.pack_grams,0) * sm.retail_units_base, 4),\n                            ssm.retail_category, ssm.taxable) as new_price',
-         'retail_price_for_pack(c.pack_cost, c.pack_grams, sm.retail_units_base, ssm.retail_category, ssm.taxable) as new_price');
+         E'case when ssm.retail_category = ''Produce'' then retail_price_for_pack(c.pack_cost, c.pack_grams, sm.retail_units_base, ssm.retail_category, ssm.taxable)\n'
+      || E'                 else retail_price_for(round(c.pack_cost / nullif(c.pack_grams,0) * sm.retail_units_base, 4),\n'
+      || E'                            ssm.retail_category, ssm.taxable) end as new_price');
   execute f;
 end $s$;
 
@@ -269,6 +276,16 @@ begin
     'skip_reason', c.skip_reason);
 end $function$;
 
+create or replace function public.price_guard_applies(p_item bigint)
+ returns boolean
+ language sql
+ stable
+ set search_path to 'public', 'pg_temp'
+as $function$
+  -- pricing-repair-2026-11-28: the out-of-date guard covers items currently in retail_category Produce
+  select exists (select 1 from square_sync_map m where m.stock_item_id = p_item and m.retail_category = 'Produce')
+$function$;
+
 create or replace function public.price_proposal_staleness(p_id bigint)
  returns jsonb
  language plpgsql
@@ -276,11 +293,14 @@ create or replace function public.price_proposal_staleness(p_id bigint)
  set search_path to 'public', 'extensions', 'pg_temp'
 as $function$
 -- pricing-repair-2026-11-28: a pending/approved proposal is out of date when the shelf price it started from has
--- moved, or (for rule-calculated proposals) the rules now give a different price.
+-- moved, or (for rule-calculated proposals) the rules now give a different price. Only items whose CURRENT
+-- retail_category is Produce are guarded (stock-item overrides included); anything else answers stale = false,
+-- guarded = false, so its decide/apply behaviour is exactly as before.
 declare q retail_price_proposal%rowtype; cur jsonb;
 begin
   select * into q from retail_price_proposal where id = p_id;
   if not found then return jsonb_build_object('stale', true, 'reason', 'proposal not found'); end if;
+  if not price_guard_applies(q.stock_item_id) then return jsonb_build_object('stale', false, 'guarded', false); end if;
   cur := price_current_calc(q.stock_item_id);
   if round(q.old_price, 2) is distinct from round((cur->>'shelf')::numeric, 2) then
     return cur || jsonb_build_object('stale', true, 'reason', 'shelf price changed', 'was_old', q.old_price, 'was_new', q.proposed_price);
@@ -288,7 +308,7 @@ begin
   if q.method in ('band', 'passthrough') and round(q.proposed_price, 2) is distinct from round((cur->>'now')::numeric, 2) then
     return cur || jsonb_build_object('stale', true, 'reason', 'calculation changed', 'was_old', q.old_price, 'was_new', q.proposed_price);
   end if;
-  return cur || jsonb_build_object('stale', false);
+  return cur || jsonb_build_object('stale', false, 'guarded', true);
 end $function$;
 
 create or replace function public.price_proposal_decide(p_ids bigint[], p_decision text, p_by text default 'Josh'::text)
@@ -296,8 +316,9 @@ create or replace function public.price_proposal_decide(p_ids bigint[], p_decisi
  language plpgsql
  set search_path to 'public', 'extensions', 'pg_temp'
 as $function$
--- pricing-repair-2026-11-28: an approval is checked first. An out-of-date pending proposal is withdrawn (superseded)
--- and, if a change is still due and no delivery tag job is open for the item, re-queued as a fresh pending proposal.
+-- pricing-repair-2026-11-28: an approval of a Produce item is checked first. An out-of-date pending proposal is
+-- withdrawn (superseded) and, if a change is still due and no delivery tag job is open for the item, re-queued as a
+-- fresh pending proposal. Other categories are approved exactly as before (price_proposal_staleness answers not stale).
 declare v_n int := 0; q record; s jsonb; c record; res jsonb; v_new bigint; v_stale jsonb := '[]'::jsonb;
 begin
   if p_decision not in ('approved','rejected') then
@@ -348,8 +369,12 @@ begin
          'declare r record; res jsonb; v_ok int := 0; v_rows jsonb := ''[]''::jsonb; v_s jsonb;');
   f := pg_temp.patch(f, E'     where q.status = ''approved'' order by q.stock_item_id, q.id\n  loop\n',
          E'     where q.status = ''approved'' order by q.stock_item_id, q.id\n  loop\n'
-      || E'    -- pricing-repair-2026-11-28: never apply an approval that has gone out of date\n'
-      || E'    if not p_dry_run then perform price_item_lock(r.stock_item_id); end if;\n'
+      || E'    -- pricing-repair-2026-11-28: re-read after the item lock (a concurrent decision or apply wins), and never\n'
+      || E'    -- apply a Produce approval that has gone out of date\n'
+      || E'    if not p_dry_run then\n'
+      || E'      perform price_item_lock(r.stock_item_id);\n'
+      || E'      continue when (select q2.status from retail_price_proposal q2 where q2.id = r.id) is distinct from ''approved'';\n'
+      || E'    end if;\n'
       || E'    v_s := price_proposal_staleness(r.id);\n'
       || E'    if (v_s->>''stale'')::boolean then\n'
       || E'      if not p_dry_run then\n'
@@ -372,10 +397,10 @@ begin
          E'  v_ids bigint[]; res jsonb; v_src text; v_bd date; v_bs bigint; v_qid bigint; v_cur jsonb; v_sug numeric;\n');
   f := pg_temp.patch(f, E'    select retail_sell_price into v_old from stock_items where id = t.stock_item_id;\n',
          E'    select retail_sell_price into v_old from stock_items where id = t.stock_item_id;\n'
-      || E'    -- pricing-repair-2026-11-28: accepting the job''s suggested price only works while it is still current;\n'
-      || E'    -- a price Josh types himself is accepted as typed.\n'
+      || E'    -- pricing-repair-2026-11-28: for Produce items, accepting the job''s suggested price only works while it is\n'
+      || E'    -- still current; a price Josh types himself is accepted as typed. Other categories unchanged.\n'
       || E'    v_sug := round((t.info->>''new'')::numeric, 2);\n'
-      || E'    if v_sug is not null and (p_price is null or round(p_price, 2) = v_sug) then\n'
+      || E'    if v_sug is not null and (p_price is null or round(p_price, 2) = v_sug) and price_guard_applies(t.stock_item_id) then\n'
       || E'      v_cur := price_current_calc(t.stock_item_id);\n'
       || E'      if (t.info ? ''old'' and round((t.info->>''old'')::numeric, 2) is distinct from round(v_old, 2))\n'
       || E'         or v_sug is distinct from round((v_cur->>''now'')::numeric, 2) then\n'
@@ -395,7 +420,7 @@ do $p$
 declare f text;
 begin
   foreach f in array array['public.retail_price_for_pack(numeric,numeric,numeric,text,boolean)', 'public.price_current_calc(bigint)',
-                           'public.price_proposal_staleness(bigint)'] loop
+                           'public.price_proposal_staleness(bigint)', 'public.price_guard_applies(bigint)'] loop
     execute format('revoke all on function %s from public, anon, authenticated', f);
     execute format('grant execute on function %s to service_role', f);
   end loop;

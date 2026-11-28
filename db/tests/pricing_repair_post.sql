@@ -9,7 +9,7 @@ begin
                      (select string_agg(f.sig, ', ') from pr_pre_fn f where f.h is not null and f.sig <> 'view'
                         and md5(case when f.sig <> 'view' and f.h is not null then pg_get_functiondef(f.sig::regprocedure) end) <> f.h));
   perform pg_temp.ck('rollback: new functions dropped, attempts table archived',
-                     not exists (select 1 from pg_proc where proname in ('retail_price_for_pack', 'price_current_calc', 'price_proposal_staleness'))
+                     not exists (select 1 from pg_proc where proname in ('retail_price_for_pack', 'price_current_calc', 'price_proposal_staleness', 'price_guard_applies'))
                      and to_regclass('public.produce_price_attempts') is null and to_regclass('public.produce_price_attempts_archived') is not null);
 end $P$;
 

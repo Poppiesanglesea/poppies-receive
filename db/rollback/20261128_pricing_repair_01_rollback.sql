@@ -1,6 +1,6 @@
 -- Rollback for pricing_repair_01 (28 Nov 2026). Run as ONE transaction.
 -- Restores v_price_rule_candidates and the seven functions from function_backup label 'pre-pricing-repair-2026-11-28',
--- then drops the three new functions. produce_price_attempts is kept as evidence (renamed *_archived, RLS on).
+-- then drops the four new functions. produce_price_attempts is kept as evidence (renamed *_archived, RLS on).
 -- Proposals, tasks and prices made while the repair was live are NOT undone (ordinary records; owner decision).
 -- If any replaced object was changed again after this migration, restoring the backup would drop that later change:
 -- the guard refuses unless each live definition still carries this migration's marker.
@@ -32,6 +32,7 @@ select fn_backup_restore('sync_part_variation_prices', 'pre-pricing-repair-2026-
 select fn_backup_restore('price_rules_scan', 'pre-pricing-repair-2026-11-28');
 
 drop function if exists public.price_proposal_staleness(bigint);
+drop function if exists public.price_guard_applies(bigint);
 drop function if exists public.price_current_calc(bigint);
 drop function if exists public.retail_price_for_pack(numeric, numeric, numeric, text, boolean);
 
@@ -39,5 +40,5 @@ alter table public.produce_price_attempts rename to produce_price_attempts_archi
 
 -- readback (expect: view without retail_price_for_pack, no new functions, archived table present)
 select pg_get_viewdef('public.v_price_rule_candidates'::regclass) like '%retail_price_for(b.new_cost%' as view_restored,
-       (select count(*) from pg_proc where proname in ('retail_price_for_pack', 'price_current_calc', 'price_proposal_staleness')) as new_fns_left,
+       (select count(*) from pg_proc where proname in ('retail_price_for_pack', 'price_current_calc', 'price_proposal_staleness', 'price_guard_applies')) as new_fns_left,
        to_regclass('public.produce_price_attempts_archived') is not null as attempts_archived;

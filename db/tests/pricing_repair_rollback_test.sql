@@ -137,12 +137,12 @@ begin
   create temp table pr_cost on commit drop as
     select distinct on (stock_item_id) stock_item_id, pack_cost, pack_grams from supplier_prices
      where not coalesce(needs_review, false) order by stock_item_id, effective_from desc, id desc;
-  perform pg_temp.ck('existing: every whole-item band price passes the exact check',
+  perform pg_temp.ck('existing: every Produce whole-item band price passes the exact check',
                      not exists (select 1 from pr_after a join pr_cost c using (stock_item_id) join retail_markups m on m.category = coalesce(
                                    (select category from retail_markups where category = a.retail_category), 'Default')
-                                  where a.method = 'band' and a.proposed_price is not null
+                                  where a.method = 'band' and a.retail_category = 'Produce' and a.proposed_price is not null
                                     and not pg_temp.exact_ok(a.proposed_price, c.pack_cost, c.pack_grams, a.retail_unit_base, m.markup_pct, coalesce(a.taxable, false))),
-                     (select count(*) || ' band rows' from pr_after where method = 'band'));
+                     (select count(*) || ' Produce band rows' from pr_after where method = 'band' and retail_category = 'Produce'));
   create temp table pr_diff on commit drop as
     select coalesce(a.stock_item_id, b.stock_item_id) id, b.proposed_price before_p, a.proposed_price after_p, coalesce(a.method, b.method) method
       from pr_after a full join pr_before b on a.stock_item_id = b.stock_item_id
@@ -153,7 +153,7 @@ begin
                      not exists (select 1 from pr_diff d join stock_items si on si.id = d.id
                                   where coalesce(d.before_p, si.retail_sell_price) - coalesce(d.after_p, si.retail_sell_price) <> 0.05),
                      (select string_agg(format('%s: %s -> %s', id, coalesce(before_p::text, 'shelf'), coalesce(after_p::text, 'shelf')), '; ') from pr_diff));
-  perform pg_temp.ck('existing: exactly the three on-step items moved; off-step, packaged and no-variation items did not',
+  perform pg_temp.ck('existing: exactly the three on-step Produce items moved; off-step, packaged, no-variation and non-Produce band items did not',
                      (select array_agg(si.name order by si.name) from pr_diff d join stock_items si on si.id = d.id)
                      = array['PRSeed Step Each 14/12', 'PRSeed Step Each 25/18', 'PRSeed Step Kg 65/12kg'],
                      (select array_agg(si.name order by si.name) from pr_diff d join stock_items si on si.id = d.id)::text);
@@ -168,8 +168,18 @@ begin
                      and not exists (select 1 from pr_parts_before b where b.stock_item_id <> pg_temp.sid('PRSeed Half 28/12')
                                        and sync_part_variation_prices(b.stock_item_id, true)::text <> b.r),
                      sync_part_variation_prices(pg_temp.sid('PRSeed Half 28/12'), true)::text);
-  perform pg_temp.ck('existing: every active half/quarter passes the exact check',
-                     not exists (select 1 from square_sales_map sm join square_sync_map ssm on ssm.stock_item_id = sm.retail_stock_item_id
+  perform pg_temp.ck('non-Produce band: repeating-decimal price keeps the original expression (12 for $14.00 -> $2.15, not $2.10)',
+                     (select proposed_price from pr_after where stock_item_id = pg_temp.sid('PRSeed Band Each 14/12')) = 2.15
+                     and (select proposed_price from pr_before where stock_item_id = pg_temp.sid('PRSeed Band Each 14/12')) = 2.15
+                     and retail_price_for(round(14.00 / 12, 4), 'PRSeed Band', false) = 2.15,
+                     (select proposed_price from pr_after where stock_item_id = pg_temp.sid('PRSeed Band Each 14/12'))::text);
+  perform pg_temp.ck('non-Produce band: half keeps the original expression ($2.15, not $2.10), identical to before',
+                     sync_part_variation_prices(pg_temp.sid('PRSeed Band Half 28/12'), true)->0->>'to' = '2.15'
+                     and sync_part_variation_prices(pg_temp.sid('PRSeed Band Half 28/12'), true)::text
+                         = (select r from pr_parts_before where stock_item_id = pg_temp.sid('PRSeed Band Half 28/12')),
+                     sync_part_variation_prices(pg_temp.sid('PRSeed Band Half 28/12'), true)::text);
+  perform pg_temp.ck('existing: every active Produce half/quarter passes the exact check',
+                     not exists (select 1 from square_sales_map sm join square_sync_map ssm on ssm.stock_item_id = sm.retail_stock_item_id and ssm.retail_category = 'Produce'
                                    join v_pricing_policy_for_item p on p.stock_item_id = ssm.stock_item_id and p.method = 'band'
                                    join pr_cost c on c.stock_item_id = ssm.stock_item_id
                                   where sm.active and sm.square_variation_id <> ssm.square_variation_id and c.pack_grams > 0
@@ -423,10 +433,25 @@ begin
   r := delivery_owner_decide(t3, 'keep', null, 'PRTest Josh');
   perform pg_temp.ck('owner screen: Keep is unchanged', (r->>'ok')::boolean and r->>'status' = 'kept', r::text);
 
+  -- non-Produce regression: owner screen and apply behave exactly as before (no out-of-date guard)
+  declare m bigint; tm bigint; qm bigint;
+  begin
+    m := pg_temp.mk('PRTest Pantry Hold M', 5.00, 3.00, 1, 1, null, null, current_date - 1, null, 'Pantry');
+    insert into delivery_tasks (source_id, supplier, invoice_number, invoice_date, department, kind, stock_item_id, square_variation_id, info, status)
+    values ('PRTEST-HOLD-2', s1, 'PRTEST-HOLD-2', current_date, 'Grocer', 'hold', m, 'PRTESTMAIN' || lpad(m::text, 12, '0'),
+            jsonb_build_object('name', 'PRTest Pantry Hold M', 'old', 4.80, 'new', 6.00), 'open') returning id into tm;
+    r := delivery_owner_decide(tm, 'approve', null, 'PRTest Josh');
+    perform pg_temp.ck('non-Produce owner screen: an old suggestion is approved exactly as before (no refusal, no refresh)',
+                       (r->>'ok')::boolean and (r->>'price')::numeric = 6.00 and r->>'code' is null
+                       and (select info->>'new' from delivery_tasks where id = tm) = '6.00'
+                       and exists (select 1 from retail_price_proposal where stock_item_id = m and status = 'authorised' and proposed_price = 6.00), r::text);
+  end;
+
   perform pg_temp.ck('privileges: new functions and the attempts table are not open to anon/authenticated',
                      not has_function_privilege('anon', 'public.price_current_calc(bigint)', 'execute')
                      and not has_function_privilege('authenticated', 'public.price_proposal_staleness(bigint)', 'execute')
                      and not has_function_privilege('anon', 'public.retail_price_for_pack(numeric,numeric,numeric,text,boolean)', 'execute')
+                     and not has_function_privilege('anon', 'public.price_guard_applies(bigint)', 'execute')
                      and not has_table_privilege('anon', 'public.produce_price_attempts', 'select')
                      and not has_table_privilege('authenticated', 'public.produce_price_attempts', 'insert'));
   perform pg_temp.ck('price_rules_scan dry run still runs', (price_rules_scan(true)->>'dry_run')::boolean);
@@ -434,8 +459,8 @@ end $S$;
 
 -- =====================================================================================================================
 -- 6. policy coverage (Codex 28 Nov 14:50): Produce item overrides and category rows are both guarded and re-queued under
---    the item's own policy; an override with lane 'never' is not re-queued; non-Produce (passthrough) approvals that are
---    still current go through exactly as before, and out-of-date ones are refused too.
+--    the item's own policy; an override with lane 'never' is not re-queued. Non-Produce (passthrough) decisions are
+--    exactly as before: current AND out-of-date legacy approvals are approved and applied as they always were.
 do $L$
 declare o1 bigint; o2 bigint; cat bigint; pt bigint; pt2 bigint; q_o1 bigint; q_o2 bigint; q_cat bigint; q_pt bigint; q_pt2 bigint; r jsonb; x record;
 begin
@@ -465,13 +490,15 @@ begin
   q_pt2 := (price_propose(jsonb_build_object('mode', 'pending', 'item', pt2, 'old', 4.00, 'new', 4.60, 'method', 'passthrough', 'lane', 'approve', 'source', 'PRTEST-PT2'))->>'proposal')::bigint;
 
   r := price_proposal_decide(array[q_o1, q_o2, q_cat, q_pt, q_pt2], 'approved', 'PRTest Josh');
-  perform pg_temp.ck('policy: the current packaged (passthrough) proposal is approved exactly as before',
-                     (select status = 'approved' and decided_by = 'PRTest Josh' from retail_price_proposal where id = q_pt) and (r->>'rows')::int = 1, r::text);
-  perform pg_temp.ck('policy: out-of-date override, category and packaged proposals are all refused',
-                     (select count(*) from retail_price_proposal where id in (q_o1, q_o2, q_cat, q_pt2) and status = 'superseded') = 4
-                     and jsonb_array_length(r->'stale') = 4, r::text);
+  perform pg_temp.ck('policy: non-Produce current and out-of-date legacy proposals are both approved exactly as before',
+                     (select count(*) from retail_price_proposal where id in (q_pt, q_pt2) and status = 'approved' and decided_by = 'PRTest Josh') = 2
+                     and (r->>'rows')::int = 2
+                     and not exists (select 1 from jsonb_to_recordset(r->'stale') s(id bigint) where s.id in (q_pt, q_pt2)), r::text);
+  perform pg_temp.ck('policy: out-of-date Produce override and category proposals are refused',
+                     (select count(*) from retail_price_proposal where id in (q_o1, q_o2, q_cat) and status = 'superseded') = 3
+                     and jsonb_array_length(r->'stale') = 3, r::text);
   for x in select s.*, q.stock_item_id item from jsonb_to_recordset(r->'stale') s(id bigint, replaced_by bigint, now numeric)
-             join retail_price_proposal q on q.id = s.id where s.id in (q_o1, q_cat, q_pt2) loop
+             join retail_price_proposal q on q.id = s.id where s.id in (q_o1, q_cat) loop
     perform pg_temp.ck(format('policy: %s re-queued at the current price under its own lane/method', (select name from stock_items where id = x.item)),
                        x.replaced_by is not null and exists (select 1 from retail_price_proposal n join v_pricing_policy_for_item p on p.stock_item_id = n.stock_item_id
                                                                where n.id = x.replaced_by and n.status = 'pending' and n.proposed_price = x.now
@@ -481,6 +508,12 @@ begin
   perform pg_temp.ck('policy: an override with lane never is withdrawn but not re-queued',
                      exists (select 1 from jsonb_to_recordset(r->'stale') s(id bigint, replaced_by bigint) where s.id = q_o2 and s.replaced_by is null)
                      and not exists (select 1 from retail_price_proposal where stock_item_id = o2 and status = 'pending'));
+  -- the non-Produce out-of-date legacy approval is applied exactly as before (a tag job at its approved $4.60)
+  r := price_proposal_apply(false);
+  perform pg_temp.ck('non-Produce apply: the out-of-date legacy approval is applied exactly as before',
+                     (select status = 'superseded' and skip_reason = 'moved to tag confirm' from retail_price_proposal where id = q_pt2)
+                     and exists (select 1 from retail_price_proposal where stock_item_id = pt2 and status = 'authorised' and proposed_price = 4.60)
+                     and exists (select 1 from delivery_tasks where stock_item_id = pt2 and kind = 'tag' and status = 'open'), r::text);
   perform pg_temp.ck('policy: override rows themselves unchanged',
                      (select count(*) from pricing_policy where scope = 'stock_item' and key in (o1::text, o2::text) and note = 'PRTest override') = 2);
 end $L$;

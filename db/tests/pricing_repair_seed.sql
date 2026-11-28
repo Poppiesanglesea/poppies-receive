@@ -5,6 +5,8 @@
 --   Half*  : a half variation on a step (affected) / off a step (unaffected)
 --   Pantry : a packaged (passthrough) item, unaffected
 --   NoVar  : a produce item with no Square variation and no shelf price (first price due)
+--   Band*  : a NON-Produce category priced by the band method; keeps its original (4-dp) expression, so its repeating-
+--            decimal prices must not change
 do $seed$
 declare i bigint;
   procedure_items jsonb := '[
@@ -47,4 +49,19 @@ begin
   insert into stock_items (name, department, count_unit, grams_per_count_unit, retail_sell_price) values ('PRSeed NoVar', 'Grocer', 'each', 1, null) returning id into i;
   insert into square_sync_map (stock_item_id, square_variation_id, square_item_name, retail_category, taxable) values (i, null, 'PRSeed NoVar', 'Produce', false);
   insert into supplier_prices (stock_item_id, supplier, pack_label, pack_grams, pack_cost, effective_from) values (i, 'PRSeed supplier', 'PRSeed pack', 1, 1.60, current_date - 3);
+
+  -- non-Produce band category (synthetic): 12 for $14.00 each (original expression $2.15), and 12 for $28.00 with a half
+  -- (half original expression $2.15, recorded $1.00 so the part sync lists it)
+  insert into pricing_policy (scope, key, lane, method, min_change_cents, max_change_pct, note)
+  values ('retail_category', 'PRSeed Band', 'approve', 'band', 20, 35, 'synthetic') on conflict do nothing;
+  insert into stock_items (name, department, count_unit, grams_per_count_unit, retail_sell_price) values ('PRSeed Band Each 14/12', 'Grocer', 'each', 1, 2.00) returning id into i;
+  insert into square_sync_map (stock_item_id, square_variation_id, square_item_name, retail_category, taxable) values (i, 'PRSEEDMAIN' || lpad(i::text, 12, '0'), 'PRSeed Band Each 14/12', 'PRSeed Band', false);
+  insert into square_sales_map (square_variation_id, square_item_name, square_variation_name, retail_stock_item_id, retail_units_base) values ('PRSEEDMAIN' || lpad(i::text, 12, '0'), 'PRSeed Band Each 14/12', 'Regular', i, 1);
+  insert into supplier_prices (stock_item_id, supplier, pack_label, pack_grams, pack_cost, effective_from) values (i, 'PRSeed supplier', 'PRSeed pack', 12, 14.00, current_date - 3);
+  insert into stock_items (name, department, count_unit, grams_per_count_unit, retail_sell_price) values ('PRSeed Band Half 28/12', 'Grocer', 'each', 1, 4.20) returning id into i;
+  insert into square_sync_map (stock_item_id, square_variation_id, square_item_name, retail_category, taxable) values (i, 'PRSEEDMAIN' || lpad(i::text, 12, '0'), 'PRSeed Band Half 28/12', 'PRSeed Band', false);
+  insert into square_sales_map (square_variation_id, square_item_name, square_variation_name, retail_stock_item_id, retail_units_base) values
+    ('PRSEEDMAIN' || lpad(i::text, 12, '0'), 'PRSeed Band Half 28/12', 'Regular', i, 1), ('PRSEEDHALF' || lpad(i::text, 12, '0'), 'PRSeed Band Half 28/12', 'Half', i, 0.5);
+  insert into retail_part_variation_price (square_variation_id, stock_item_id, price) values ('PRSEEDHALF' || lpad(i::text, 12, '0'), i, 1.00);
+  insert into supplier_prices (stock_item_id, supplier, pack_label, pack_grams, pack_cost, effective_from) values (i, 'PRSeed supplier', 'PRSeed pack', 12, 28.00, current_date - 3);
 end $seed$;
