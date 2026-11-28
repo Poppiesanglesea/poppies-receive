@@ -194,15 +194,21 @@ async function needsScreen() {
      return `<div class="card"><b>${esc(d.item_name || i.description)}${d.variation_name && d.variation_name!=="Regular" ? " — " + esc(d.variation_name) : ""}</b>
      <div class="muted">${esc(dr.supplier)} · ${esc(dr.department)} · cost ex GST ${d.unit_cost_ex != null ? "$" + Number(d.unit_cost_ex).toFixed(2) : "unknown"}</div>
      <div class="note">${esc(x.note || "")}</div>
-     ${x.status === "needs_josh" && d.action && d.action !== "unsure" ? `<div class="row"><input id="p${x.id}" inputmode="decimal" placeholder="Shelf price incl. GST" style="max-width:220px"><button class="primary" onclick="setPrice(${x.id})">Set price and create</button></div><div id="m${x.id}"></div>` : `<p class="muted">Needs checking in a chat with Claude.</p>`}</div>`; }).join("")}
+     ${x.status === "needs_josh" && d.action && d.action !== "unsure" ? `<div class="row"><input id="p${x.id}" inputmode="decimal" placeholder="Shelf price incl. GST" style="max-width:220px"><button class="primary" id="sp${x.id}" onclick="setPrice(${x.id})">Set price and create</button></div><div id="m${x.id}"></div>` : `<p class="muted">Needs checking in a chat with Claude.</p>`}</div>`; }).join("")}
    <button class="secondary" onclick="homeScreen()">Back</button>`);
 }
-async function setPrice(id) {
-  const v = document.getElementById("p" + id).value, m = document.getElementById("m" + id);
-  m.innerHTML = `<div class="spinner"></div>`;
-  const r = await api("/owner/price", { method: "POST", body: JSON.stringify({ line_id: id, price: v }) });
-  const res = (r.body && r.body.result) || {};
-  m.innerHTML = r.ok ? `<div class="note ok">${esc(res.status === "created" ? "Created in Square." : res.status === "dry_run" ? "Test mode: recorded, not created in Square." : (res.status || "Done"))}</div>` : `<div class="note err">${esc(r.body.error || "Couldn't save")}</div>`;
+function setPrice(id) {
+  return once("price" + id, async () => {
+    const input = document.getElementById("p" + id), m = document.getElementById("m" + id), b = document.getElementById("sp" + id);
+    const v = parsePrice(input.value);
+    if (!(v > 0)) { m.innerHTML = `<div class="note err">Type the shelf price, like 4.50.</div>`; return; }
+    if (b) b.disabled = true;
+    m.innerHTML = `<div class="spinner"></div>`;
+    const r = await api("/owner/price", { method: "POST", body: JSON.stringify({ line_id: id, price: v }) });
+    const res = (r.body && r.body.result) || {};
+    if (r.ok) { input.disabled = true; } else if (b) b.disabled = false;   // after success the button stays off: no second create
+    m.innerHTML = r.ok ? `<div class="note ok">${esc(res.status === "created" ? "Created in Square." : res.status === "dry_run" ? "Test mode: recorded, not created in Square." : (res.status || "Done"))}</div>` : `<div class="note err">${esc(r.body.error || "Couldn't save")}</div>`;
+  });
 }
 let RETAIL = { cards: [], staff: [] }, retailForm = null;
 async function loadRetail() {
@@ -444,10 +450,10 @@ function openBox(id) {
 function saveBox(id) {
   const b = findBox(id), n = Number(document.getElementById("bv" + id).value), m = document.getElementById("bm" + id);
   if (!(n > 0)) { m.innerHTML = `<div class="note err">Enter what was in the box.</div>`; return; }
-  pickName(async () => {
-    const res = await api(`/deliveries/${encodeURIComponent(S.delivery)}/boxes/${id}/report`, { method: "POST", body: JSON.stringify({ actual: n, by: WHO }) });
-    await afterAction(res, res.body && res.body.status === "same" ? "That's the usual size — nothing changed." : "Saved. This delivery's stock and cost are fixed. Josh will decide if it's the new usual size.");
-  });
+  pickName(() => once("box" + id, async () => {
+    const v0 = VIEW, res = await api(`/deliveries/${encodeURIComponent(S.delivery)}/boxes/${id}/report`, { method: "POST", body: JSON.stringify({ actual: n, by: WHO }) });
+    await afterAction(res, res.body && res.body.status === "same" ? "That's the usual size — nothing changed." : "Saved. This delivery's stock and cost are fixed. Josh will decide if it's the new usual size.", v0);
+  }));
 }
 function boxDecisionRow(t) {
   const i = t.info || {}, u = (v) => esc(unitWord(i.count_unit, Number(v)));
@@ -533,10 +539,10 @@ function saveCount(id) {
     if (!unit) { m.innerHTML = `<div class="note err">Say what you counted: kg, items or bunches.</div>`; return; }
     note = "unit: " + unit;
   }
-  pickName(async () => {
-    const res = await api(`/tasks/${id}/count`, { method: "POST", body: JSON.stringify({ stock_item_id: item, count: n, by: WHO, ...(note ? { note } : {}) }) });
-    await afterAction(res, item ? "Saved. Stock booked and price checked." : "Saved. Josh will set up the new product.");
-  });
+  pickName(() => once("count" + id, async () => {
+    const v0 = VIEW, res = await api(`/tasks/${id}/count`, { method: "POST", body: JSON.stringify({ stock_item_id: item, count: n, by: WHO, ...(note ? { note } : {}) }) });
+    await afterAction(res, item ? "Saved. Stock booked and price checked." : "Saved. Josh will set up the new product.", v0);
+  }));
 }
 function holdRow(t) {
   const i = t.info || {}, a = t.answer || {};
@@ -565,10 +571,12 @@ function decideTyped(id) {
   }
   return decide(id, "approve", Number(raw));
 }
-async function decide(id, decision, price) {
-  const res = await api(`/owner/tasks/${id}/decide`, { method: "POST", body: JSON.stringify({ decision, price: price === undefined ? null : price }) });
-  const isBox = DLV.cards.some(c => (c.tasks || []).some(t => t.id === id && t.kind === "boxsize"));
-  await afterAction(res, decision === "keep" ? "Kept as it was." : isBox ? "New usual box size saved for future deliveries." : (res.body && res.body.register === "on tag confirm" ? "Price approved. Staff will see a tag to change; the register updates when they confirm it." : "Price changed in Square. Staff will see a tag to change."));
+function decide(id, decision, price) {
+  return once("decide" + id, async () => {
+    const v0 = VIEW, res = await api(`/owner/tasks/${id}/decide`, { method: "POST", body: JSON.stringify({ decision, price: price === undefined ? null : price }) });
+    const isBox = DLV.cards.some(c => (c.tasks || []).some(t => t.id === id && t.kind === "boxsize"));
+    await afterAction(res, decision === "keep" ? "Kept as it was." : isBox ? "New usual box size saved for future deliveries." : (res.body && res.body.register === "on tag confirm" ? "Price approved. Staff will see a tag to change; the register updates when they confirm it." : "Price changed in Square. Staff will see a tag to change."), v0);
+  });
 }
 // Josh: register prices the tag confirm stopped on (main price changed elsewhere; smaller tag conflicting or unknown).
 function opsToCheck(t) {
@@ -585,16 +593,22 @@ function opRow(t, o) {
     <button class="primary small" onclick="resolveOp(${o.op},'overwrite')">Update to ${money(o.new)}</button>
     <button class="secondary small" onclick="resolveOp(${o.op},'skip')">Leave register as is</button></div></div>`;
 }
-async function resolveOp(op, action) {
-  const el = document.getElementById("rn" + op);
-  const now = el ? Number(String(el.value).replace(/[^0-9.]/g, "")) : NaN;
-  if (action === "overwrite" && !(el && el.value.trim() !== "" && Number.isFinite(now))) {
-    return afterAction({ ok: false, body: { error: "Enter the price the register shows now." } }, null);
-  }
-  const known = el && el.value.trim() !== "" && Number.isFinite(now);
-  const res = await api(`/owner/price-ops/${op}/resolve`, { method: "POST", body: JSON.stringify({ action, register_now: known ? now : null }) });
-  await afterAction(res, action === "skip" ? "Register left as it is. If staff already changed the tag, they'll be asked to put it back."
-    : "Saved. Staff will see the tag button again; the register updates when they confirm.");
+// A register price as typed: "4.50", "$4.50" or "4,50" (decimal comma). Returns null when empty, NaN when unreadable.
+// (Before: every non-digit was stripped, so "1,50" became 150.)
+function parsePrice(v) {
+  const raw = String(v ?? "").trim().replace(/^\$\s*/, "");
+  if (!raw) return null;
+  return /^\d{1,4}([.,]\d{1,2})?$/.test(raw) ? Number(raw.replace(",", ".")) : NaN;
+}
+function resolveOp(op, action) {
+  return once("op" + op, async () => {
+    const el = document.getElementById("rn" + op), now = el ? parsePrice(el.value) : null;
+    if (Number.isNaN(now)) return afterAction({ ok: false, body: { error: "That price isn't a number like 4.50." } }, null);
+    if (action === "overwrite" && now === null) return afterAction({ ok: false, body: { error: "Enter the price the register shows now." } }, null);
+    const v0 = VIEW, res = await api(`/owner/price-ops/${op}/resolve`, { method: "POST", body: JSON.stringify({ action, register_now: now }) });
+    await afterAction(res, action === "skip" ? "Register left as it is. If staff already changed the tag, they'll be asked to put it back."
+      : "Saved. Staff will see the tag button again; the register updates when they confirm.", v0);
+  });
 }
 // One shelf-tag job: the main tag row, then one row per half/quarter tag in the same group (names and prices only).
 const PART_STATE = { applied: "✓ register updated", skipped: "left as is", blocked: "Josh to check", conflict: "Josh to check",
@@ -639,6 +653,9 @@ function tagCell(t) {
   const label = retry ? "Try again — update register" : n > 1 ? `All ${n} tags changed — update register` : "Tag changed — update register";
   return `${retry ? `<div class="muted" style="color:var(--bad)">Last try didn't finish.</div>` : ""}${n > 1 && !retry ? `<div class="muted">Change the main tag and the smaller tags first.</div>` : ""}<button class="primary small" id="tag${t.id}" onclick="tickTag(${t.id})">${label}</button>`;
 }
+// One request at a time per button: a second tap while the first is in flight does nothing.
+const BUSY = {};
+async function once(key, fn) { if (BUSY[key]) return; BUSY[key] = true; try { return await fn(); } finally { delete BUSY[key]; } }
 let TAG_BUSY = {};
 function tickTag(id) {
   if (TAG_BUSY[id]) return;
@@ -647,16 +664,19 @@ function tickTag(id) {
     TAG_BUSY[id] = true;
     const b = document.getElementById("tag" + id); if (b) { b.disabled = true; b.textContent = "Updating…"; }
     try {
-      const res = await api(`/tasks/${id}/tick`, { method: "POST", body: JSON.stringify({ by: WHO }) });
-      await afterAction(res, res.ok && res.body && res.body.register === "updated" ? "Register updated." : null);
+      const v0 = VIEW, res = await api(`/tasks/${id}/tick`, { method: "POST", body: JSON.stringify({ by: WHO }) });
+      await afterAction(res, res.ok && res.body && res.body.register === "updated" ? "Register updated." : null, v0);
       // (a partial result arrives as an error with its own wording; the row then shows what is left)
     } catch (e) { /* 401: setup screen already shown */ }
     finally { delete TAG_BUSY[id]; }
   });
 }
-async function afterAction(res, okText) {
+// v0 = VIEW when the save started. If staff have moved to another screen since, only the data is refreshed:
+// the reply must never be drawn over (and wipe) the screen they are on now.
+async function afterAction(res, okText, v0) {
   const sid = S.delivery, view = S.view;
   await fetchDeliveries();
+  if (v0 !== undefined && VIEW !== v0) return;
   const msg = res.ok ? (okText ? { ok: true, text: okText } : null) : { ok: false, text: (res.body && res.body.error) || "Couldn't save. Try again." };
   view === "josh" ? joshScreen(msg) : deliveryScreen(sid, msg);
 }
@@ -799,7 +819,7 @@ function linesScreen(rec) {
   <div class="card"><table><thead><tr><th>Product</th><th style="width:80px">How many</th><th style="width:80px">Unit</th><th style="width:96px">Cost each</th><th style="width:96px"></th></tr></thead><tbody id="ln"></tbody></table>
   <div class="row"><button class="secondary" onclick="addLine()">+ Add a product that's not listed</button></div></div>
   <div id="cmsg"></div>
-  <div class="row"><button class="primary" id="go" onclick="submitLines()">Send for set-up</button><button class="secondary" onclick="cancelRec()">Cancel</button></div>`);
+  <div class="row"><button class="primary" id="go" onclick="submitLines()">Send for set-up</button><button class="secondary" id="cancel" onclick="cancelRec()">Cancel</button></div>`);
   drawLines();
 }
 function drawLines() {
@@ -883,6 +903,7 @@ async function submitLines() {
   const go = document.getElementById("go");
   if (go.disabled) return;
   go.disabled = true;
+  const cx = document.getElementById("cancel"); if (cx) cx.disabled = true;   // no Cancel while the send is in flight
   m.innerHTML = '<div class="spinner"></div>';
   const path = `/receipts/${REC.id}`;
   try {
@@ -907,13 +928,24 @@ async function submitLines() {
     return;
   } finally {
     go.disabled = false;
+    if (cx) cx.disabled = false;
   }
   S.receipt = null;
   $(`<h2>Sent ✓</h2><div class="note ok">${live.length} product${live.length>1?"s":""} sent for set-up.</div>
    <p>New products will be added to Square automatically. When this delivery shows <b>"in Square — print labels"</b> under Recent deliveries, print the shelf tags and plant labels from Square.</p>
    <p class="muted">Keep the paperwork with the others as usual.</p><button class="primary" onclick="homeScreen()">Done</button>`);
 }
-async function cancelRec(){ await api(`/receipts/${REC.id}/cancel`, { method: "POST" }); S.receipt = null; homeScreen(); }
+async function cancelRec(){
+  const go = document.getElementById("go"); if (go && go.disabled) return;   // a send is in flight
+  const r = await api(`/receipts/${REC.id}/cancel`, { method: "POST" });
+  if (!r.ok) {
+    const m = document.getElementById("cmsg");
+    if (r.status === 409) { S.receipt = null; return $('<h2>Already sent</h2><p>This delivery was already sent for set-up, so it wasn\'t cancelled. Check it under Recent deliveries.</p><button class="primary" onclick="homeScreen()">Done</button>'); }
+    if (m) m.innerHTML = `<div class="note err">${esc((r.body && r.body.error) || "Couldn't cancel. Try again.")}</div>`;
+    return;
+  }
+  S.receipt = null; homeScreen();
+}
 
 document.addEventListener("click", idle); document.addEventListener("input", idle);
 homeScreen();
