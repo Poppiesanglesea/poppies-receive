@@ -18,7 +18,8 @@ begin
               where r.origin = 'invoice_line' and l.status = 'square_created') then
     raise exception 'retail_lines_01 rollback refused: a product is in Square but not yet linked (square_created)';
   end if;
-  if pg_get_functiondef('public.new_stock_apply(bigint, boolean)'::regprocedure) not like '%staff_new_but_known%' then
+  if pg_get_functiondef('public.new_stock_apply(bigint, boolean)'::regprocedure) not like '%staff_new_but_known%'
+     or pg_get_functiondef('public.new_stock_apply(bigint, boolean)'::regprocedure) not like '%planned_in_mode%' then
     raise exception 'retail_lines_01 rollback refused: new_stock_apply changed after this migration; restore by hand';
   end if;
   if pg_get_functiondef('public.delivery_recent_list(text)'::regprocedure) not like '%r.origin = ''photo''%' then
@@ -29,6 +30,7 @@ end $$;
 select fn_backup_restore('new_stock_apply', 'pre-retail-lines-2026-11-28');
 select fn_backup_restore('delivery_recent_list', 'pre-retail-lines-2026-11-28');
 
+drop function if exists public.delivery_retail_promote(bigint, uuid, text);
 drop function if exists public.delivery_retail_answer(bigint, text, jsonb, uuid, text);
 drop function if exists public.delivery_retail_lines_list();
 drop function if exists public.delivery_retail_line_json(bigint, boolean);

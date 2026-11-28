@@ -13,6 +13,10 @@
 --    reader's guess; "known" decisions go to Josh instead of mapping silently; a carton code is never used as the shelf
 --    barcode or SKU. Photo-flow lines are unaffected (the new keys are absent).
 --  * Patches delivery_recent_list to list only origin = 'photo' receipts.
+--  * Rev 2 (28 Nov, Codex review): the list is read-only (STABLE; it never requeues anything). A "new" answer records
+--    the set-up mode it was made in; a plan made while new-stock set-up was in test mode stays a plan (new_stock_apply
+--    forces a dry run for it) until Josh promotes it with delivery_retail_promote (owner key). Lines carry their own
+--    department; cards list all departments.
 -- Mutations on apply: two new tables (empty), one new column with default, function backups, function replacements.
 -- No change to stock, invoices, prices, mappings or Square on apply.
 -- Rollback: db/rollback/20261128_retail_lines_01_rollback.sql
@@ -45,6 +49,10 @@ create table if not exists public.delivery_retail_answers (
   reason text,
   confirmed text[] not null default '{}',
   receipt_id uuid references public.delivery_receipts(id),
+  setup_mode text check (setup_mode in ('live', 'dry_run')),
+  promoted_at timestamptz,
+  promoted_by text,
+  promote_op_id uuid unique,
   result jsonb,
   op_id uuid not null unique,
   created_at timestamptz not null default now()
@@ -203,7 +211,8 @@ $$;
 -- 4. one line as the app sees it
 create or replace function public.delivery_retail_line_json(p_unmatched_id bigint, p_with_candidates boolean default true) returns jsonb
 language plpgsql stable security definer set search_path to 'public' as $$
-declare u ingest_unmatched; a delivery_retail_answers; v_status text; v_note text; n record; v_rs text;
+declare u ingest_unmatched; a delivery_retail_answers; v_status text; v_note text; n record; v_rs text; v_promo boolean := false;
+  v_mode text := coalesce((select value from app_config where key = 'new_stock_mode'), 'dry_run');
 begin
   select * into u from ingest_unmatched where id = p_unmatched_id;
   select * into a from delivery_retail_answers where unmatched_id = p_unmatched_id;
@@ -219,7 +228,11 @@ begin
   else
     select r.setup_status into v_rs from delivery_receipts r where r.id = a.receipt_id;
     select l.status, l.note into n from new_stock_lines l where l.receipt_id = a.receipt_id order by l.line_no limit 1;
-    if n.status in ('needs_josh', 'failed', 'square_created') then
+    -- a plan made in test mode is never turned into a real product by itself
+    v_promo := a.setup_mode = 'dry_run' and a.promoted_at is null and v_mode = 'live';
+    if v_promo then
+      v_status := 'with_josh'; v_note := 'Planned while product set-up was in test mode. Josh needs to approve creating it.';
+    elsif n.status in ('needs_josh', 'failed', 'square_created') then
       v_status := 'with_josh'; v_note := coalesce(n.note, 'Set-up needs Josh.');
     elsif n.status = 'dry_run' or v_rs = 'dry_run' then
       v_status := 'setting_up'; v_note := 'Test mode: planned, not created in Square yet.';
@@ -233,6 +246,8 @@ begin
   end if;
   return jsonb_build_object(
     'unmatched_id', u.id,
+    'department', canonical_department(u.department),
+    'needs_promotion', v_promo,
     'description', regexp_replace(u.description, '\s*\[UNRESOLVED UNIT:[^\]]*\]$', ''),
     'qty', u.qty, 'unit', u.unit,
     'invoice_unit_cost_ex', round(u.unit_price, 4),
@@ -246,19 +261,12 @@ begin
     'candidates', case when v_status = 'open' and p_with_candidates then delivery_retail_candidates(u.id) end);
 end $$;
 
--- 5. list (also re-queues test-mode "new" set-ups once new-stock set-up is live, so they are not stranded)
+-- 5. list — read-only (STABLE: the database refuses any write from it)
 create or replace function public.delivery_retail_lines_list() returns jsonb
-language plpgsql security definer set search_path to 'public' as $$
+language plpgsql stable security definer set search_path to 'public' as $$
 declare v_mode text := coalesce((select value from app_config where key = 'new_stock_mode'), 'dry_run');
   v_produce text[] := delivery_retail_produce_suppliers(); v_cards jsonb;
 begin
-  if v_mode = 'live' then
-    update new_stock_lines l set status = 'pending', result = null, price = null, sku = null, awaiting_price = false
-      from delivery_receipts r
-     where r.id = l.receipt_id and r.origin = 'invoice_line' and l.status = 'dry_run';
-    update delivery_receipts set setup_status = 'pending'
-     where origin = 'invoice_line' and setup_status = 'dry_run';
-  end if;
   with ids as (
          select u.id from ingest_unmatched u
            join processed_invoices p on 'invoice:' || p.source_id = u.source_tag
@@ -273,7 +281,9 @@ begin
   select jsonb_agg(c order by c->>'invoice_date' desc, c->>'supplier', c->>'source_id') into v_cards from (
     select jsonb_build_object(
              'source_id', p.source_id, 'supplier', canonical_supplier(p.supplier), 'invoice_number', p.invoice_number,
-             'invoice_date', p.invoice_date, 'department', canonical_department(min(u.department)),
+             'invoice_date', p.invoice_date,
+             'department', case when count(distinct canonical_department(u.department)) = 1 then canonical_department(min(u.department)) end,
+             'departments', to_jsonb(array_agg(distinct canonical_department(u.department) order by canonical_department(u.department))),
              'open', count(*) filter (where r.l->>'status' = 'open'),
              'lines', jsonb_agg(r.l order by u.id)) c
       from full_lines r
@@ -292,6 +302,7 @@ declare
   v_hash text; v_by text := btrim(coalesce(p_by, '')); v_units int; v_confirm text[]; v_checks jsonb := '[]'; v_soft text[] := '{}';
   v_printed int; v_facts jsonb; v_cost numeric; v_shelf_ex numeric; v_barcode text; v_carton text; v_hit text;
   v_item bigint; v_map jsonb; v_receipt uuid; v_resp jsonb; v_line jsonb; v_name text; v_note text; v_reason text;
+  v_mode text := case when (select value from app_config where key = 'new_stock_mode') = 'live' then 'live' else 'dry_run' end;
 begin
   if p_op_id is null then return jsonb_build_object('http', 400, 'body', jsonb_build_object('ok', false, 'code', 'invalid', 'error', 'Missing op_id.')); end if;
   if p_action not in ('existing', 'new', 'josh') then return jsonb_build_object('http', 400, 'body', jsonb_build_object('ok', false, 'code', 'invalid', 'error', 'Unknown action.')); end if;
@@ -445,14 +456,14 @@ begin
                 'invoice_description', regexp_replace(u.description, '\s*\[UNRESOLVED UNIT:[^\]]*\]$', ''),
                 'qty', u.qty, 'unit', u.unit, 'unit_price', u.unit_price, 'source', 'invoice',
                 'barcode', v_barcode, 'carton_code', v_carton,
-                'staff_units_per_invoice_unit', v_units, 'invoice_unit_cost_ex', u.unit_price,
+                'staff_units_per_invoice_unit', v_units, 'invoice_unit_cost_ex', u.unit_price, 'planned_in_mode', v_mode,
                 'note', trim(both ' ' from concat_ws(' ', format('Staff counted %s sellable units per invoice unit (unit_price is ex GST per invoice unit).', v_units),
                                                        case when v_carton is not null then 'The code on the invoice line is the carton code, not the shelf barcode.' end,
                                                        case when coalesce(v_body->'no_barcode' = 'true'::jsonb, false) then 'Item has no barcode.' end, v_note))))),
               jsonb_build_object('origin', 'invoice_line', 'op_id', p_op_id));
-      insert into delivery_retail_answers (unmatched_id, action, by_name, units, barcode, no_barcode, name, note, confirmed, receipt_id, op_id)
+      insert into delivery_retail_answers (unmatched_id, action, by_name, units, barcode, no_barcode, name, note, confirmed, receipt_id, setup_mode, op_id)
       values (u.id, 'new', v_by, v_units, v_barcode, coalesce(v_body->'no_barcode' = 'true'::jsonb, false), v_name, v_note,
-              coalesce((select array_agg(c) from unnest(v_soft) c), '{}'), v_receipt, p_op_id);
+              coalesce((select array_agg(c) from unnest(v_soft) c), '{}'), v_receipt, v_mode, p_op_id);
       insert into engine_runs (steps_ok, steps_failed, notes)
       values (1, 0, left(format('NEW-STOCK-APP submitted source=retail-line:%s supplier=%s dept=%s lines=1 (from invoice line, by %s)',
                                 u.id, canonical_supplier(u.supplier), canonical_department(u.department), v_by), 500));
@@ -465,10 +476,59 @@ begin
   return jsonb_build_object('http', 200, 'body', v_resp || jsonb_build_object('line', v_line));
 end $$;
 
+-- 6b. explicit promotion of a test-mode plan (owner key only, via the Edge owner route). Requires set-up to be live.
+create or replace function public.delivery_retail_promote(p_unmatched_id bigint, p_op_id uuid, p_by text default 'Josh')
+returns jsonb language plpgsql security definer set search_path to 'public', 'pg_temp' as $$
+declare u ingest_unmatched; a delivery_retail_answers; v_resp jsonb; v_line jsonb;
+begin
+  if p_op_id is null then return jsonb_build_object('http', 400, 'body', jsonb_build_object('ok', false, 'code', 'invalid', 'error', 'Missing op_id.')); end if;
+  select * into u from ingest_unmatched where id = p_unmatched_id for update;
+  select * into a from delivery_retail_answers where unmatched_id = p_unmatched_id for update;
+  if u.id is null or a.unmatched_id is null or a.action <> 'new' or a.setup_mode is distinct from 'dry_run' then
+    return jsonb_build_object('http', 404, 'body', jsonb_build_object('ok', false, 'code', 'not_found', 'error', 'No test-mode plan for this line.'));
+  end if;
+  if a.promoted_at is not null then
+    if a.promote_op_id = p_op_id then
+      return jsonb_build_object('http', 200, 'body', jsonb_build_object('ok', true, 'replayed', true, 'receipt_id', a.receipt_id,
+                                'status', (delivery_retail_line_json(u.id, false))->>'status', 'line', delivery_retail_line_json(u.id, false)));
+    end if;
+    return jsonb_build_object('http', 409, 'body', jsonb_build_object('ok', false, 'code', 'already_answered',
+                              'error', 'Already approved.', 'line', delivery_retail_line_json(u.id, false)));
+  end if;
+  if u.resolved_at is not null then
+    return jsonb_build_object('http', 409, 'body', jsonb_build_object('ok', false, 'code', 'already_answered',
+                              'error', 'This line is already booked.', 'line', delivery_retail_line_json(u.id, false)));
+  end if;
+  if coalesce((select value from app_config where key = 'new_stock_mode'), 'dry_run') <> 'live' then
+    return jsonb_build_object('http', 409, 'body', jsonb_build_object('ok', false, 'code', 'setup_test_mode',
+                              'error', 'Product set-up is still in test mode, so nothing can be created yet.', 'line', delivery_retail_line_json(u.id, false)));
+  end if;
+  update delivery_receipts set submitted_lines = jsonb_set(submitted_lines, '{0,promoted}', 'true'::jsonb), setup_status = 'pending'
+   where id = a.receipt_id;
+  update new_stock_lines set input = input || '{"promoted": true}'::jsonb,
+         status = case when status = 'dry_run' then 'pending' else status end,
+         result = case when status = 'dry_run' then null else result end,
+         price = case when status = 'dry_run' then null else price end,
+         sku = case when status = 'dry_run' then null else sku end,
+         awaiting_price = case when status = 'dry_run' then false else awaiting_price end
+   where receipt_id = a.receipt_id;
+  update delivery_retail_answers set promoted_at = now(), promoted_by = left(coalesce(nullif(btrim(p_by), ''), 'Josh'), 40), promote_op_id = p_op_id
+   where unmatched_id = u.id;
+  insert into engine_runs (steps_ok, steps_failed, notes)
+  values (1, 0, left(format('DELIVERY-APP retail line test-mode plan approved by %s: %s (receipt %s)', coalesce(p_by, 'Josh'), u.description, a.receipt_id), 500));
+  v_line := delivery_retail_line_json(u.id, false);
+  return jsonb_build_object('http', 200, 'body', jsonb_build_object('ok', true, 'status', v_line->>'status', 'receipt_id', a.receipt_id, 'line', v_line));
+end $$;
+
 -- 7. new_stock_apply: staff-confirmed units/cost, no silent "known", carton code never a shelf code
 do $$
 declare d text := pg_get_functiondef('public.new_stock_apply(bigint, boolean)'::regprocedure); o text;
 begin
+  o := d;
+  d := replace(d, $a$  d := coalesce(l.decision, '{}'); i := l.input;$a$, $a$  d := coalesce(l.decision, '{}'); i := l.input;
+  -- retail waiting lines (28 Nov 2026): a plan made while set-up was in test mode stays a plan until Josh promotes it
+  if i->>'planned_in_mode' = 'dry_run' and not coalesce((i->>'promoted')::boolean, false) then p_dry_run := true; end if;$a$);
+  if d = o then raise exception 'new_stock_apply patch 0 (test-mode plan guard) did not apply'; end if;
   o := d;
   d := replace(d, $a$  if v_action = 'known' then
     v_known := $a$, $a$  if v_action = 'known' and i ? 'staff_units_per_invoice_unit' then
@@ -530,7 +590,8 @@ begin
               and p.proname in ('delivery_gtin_ok', 'delivery_retail_printed_pack', 'delivery_gtin_inner', 'delivery_retail_line_ok',
                                 'delivery_retail_produce_suppliers', 'delivery_retail_candidates_bulk',
                                 'delivery_retail_item_eligible', 'delivery_retail_facts', 'delivery_retail_option', 'delivery_retail_candidates',
-                                'delivery_retail_search', 'delivery_retail_line_json', 'delivery_retail_lines_list', 'delivery_retail_answer')
+                                'delivery_retail_search', 'delivery_retail_line_json', 'delivery_retail_lines_list', 'delivery_retail_answer',
+                                'delivery_retail_promote')
   loop
     execute format('revoke all on function %s from public, anon, authenticated', f);
     execute format('grant execute on function %s to service_role', f);

@@ -1,6 +1,6 @@
 -- retail_lines_01 integration test — ROLLED BACK. 28 Nov 2026.
--- Run as ONE query, appended after db/migrations/20261128_retail_lines_01.sql:
---   cat db/migrations/20261128_retail_lines_01.sql db/tests/retail_lines_rollback_test.sql | <one execute_sql call>
+-- Run as ONE query: cat db/tests/retail_lines_pre.sql db/migrations/20261128_retail_lines_01.sql \
+--                      db/tests/retail_lines_rollback_test.sql | <one execute_sql call>
 -- The last statement always raises 'RL-RESULTS {...}', so the migration, fixtures and every write roll back together
 -- (verified separately: a table created in the same query does not survive). Square is replaced by a stub inside
 -- the transaction; the real square_api is never reached. Fixtures are synthetic (no business data).
@@ -34,13 +34,22 @@ declare
   a bigint; b bigint; c bigint; k bigint; u1 bigint; u2 bigint; u3 bigint; u4 bigint; u5 bigint; u6 bigint; u7 bigint; u8 bigint;
   r jsonb; r2 jsonb; l jsonb; cards jsonb; op1 uuid := gen_random_uuid(); op2 uuid := gen_random_uuid(); op3 uuid := gen_random_uuid();
   n int; n2 int; v_cat text; v_line bigint; v_receipt uuid; d text; photo_before int; si bigint; t0 timestamptz;
+  u9 bigint; u10 bigint; v_gcat text; opP uuid := gen_random_uuid(); n_sq int;
 begin
+  update app_config set value = 'dry_run' where key = 'new_stock_mode';   -- answers below start in test mode
   -- ---------- fixtures
   inner13 := delivery_gtin_inner('1' || base12 || '0');           -- inner GTIN-13 of the carton (check digit recomputed)
   for i in 0..9 loop if delivery_gtin_ok('1' || base12 || i) then carton := '1' || base12 || i; end if; end loop;
   for i in 0..9 loop if delivery_gtin_ok('19300000002' || '05' || i) then carton2 := '19300000002' || '05' || i; end if; end loop;
   for i in 0..9 loop if delivery_gtin_ok('930000000999' || i) then good13 := '930000000999' || i; end if; end loop;
   for i in 0..9 loop if delivery_gtin_ok('930000000888' || i) then known13 := '930000000888' || i; end if; end loop;
+  perform pg_temp.ck('preserved: barcode lookup, name matching, fixed-price writers and booking functions unchanged',
+                     (select count(*) from rl_pre) >= 10 and not exists (select 1 from rl_pre x join pg_proc p on p.oid = x.sig::regprocedure
+                                                                          where md5(pg_get_functiondef(p.oid)) <> x.h),
+                     (select string_agg(sig, ', ') from rl_pre));
+  perform pg_temp.ck('preserved: fixed-price writers still set FIXED_PRICING',
+                     pg_get_functiondef('public.price_square_put(text,bigint,integer,text)'::regprocedure) like '%FIXED_PRICING%'
+                     and pg_get_functiondef('public.square_set_variation_price(text,integer)'::regprocedure) like '%FIXED_PRICING%');
   perform pg_temp.ck('fixture: GTIN helpers', delivery_gtin_ok(carton) and delivery_gtin_ok(inner13) and delivery_gtin_ok(good13)
                      and delivery_gtin_ok('4006381333931') and not delivery_gtin_ok('4006381333932') and delivery_gtin_inner(carton) = inner13
                      and delivery_gtin_ok(delivery_gtin_inner(carton2)) and delivery_gtin_inner('4006381333931') is null,
@@ -85,9 +94,15 @@ begin
     (SUP, 'RLTest Biscuits Booking Fail (6)', 12, current_date - 2, 1, null, 'invoice:RLTEST-1', null, 'Grocer', now()) returning id into u7;
   insert into ingest_unmatched (supplier, description, unit_price, invoice_date, qty, unit, source_tag, sku, department, seen_at) values
     (SUP, 'RLTest Second New Jam 250g (6)', 30, current_date - 2, 1, null, 'invoice:RLTEST-1', null, 'Grocer', now()) returning id into u8;
+  insert into processed_invoices (source_id, supplier, invoice_number, invoice_date, department, line_count, booked_count, unmatched_count) values
+    ('RLTEST-5', SUP, 'RL-INV-5', current_date - 1, 'Grocer', 2, 0, 2);
+  insert into ingest_unmatched (supplier, description, unit_price, invoice_date, qty, unit, source_tag, sku, department, seen_at) values
+    (SUP, 'RLTest Mixed Grocer Jar', 5, current_date - 1, 1, null, 'invoice:RLTEST-5', null, 'Grocer', now()) returning id into u9;
+  insert into ingest_unmatched (supplier, description, unit_price, invoice_date, qty, unit, source_tag, sku, department, seen_at) values
+    (SUP, 'RLTest Mixed Garden Pot', 7, current_date - 1, 1, null, 'invoice:RLTEST-5', null, 'Garden', now()) returning id into u10;
   insert into invoice_lines (source_id, line_no, supplier, booked, description, department, qty, invoice_date, invoice_number, kind)
   select substr(source_tag, 9), row_number() over (partition by source_tag order by id), SUP, false, description, department, qty, invoice_date,
-         'RL', 'invoice' from ingest_unmatched where id in (u1, u2, u3, u4, u5, u6, u7, u8);
+         'RL', 'invoice' from ingest_unmatched where id in (u1, u2, u3, u4, u5, u6, u7, u8, u9, u10);
 
   -- ---------- list, eligibility, candidates, search
   t0 := clock_timestamp();
@@ -98,6 +113,16 @@ begin
   l := (select x from jsonb_array_elements(cards) cd, jsonb_array_elements(cd->'lines') x where (x->>'unmatched_id')::bigint = u1);
   perform pg_temp.ck('list: line shape', l->>'status' = 'open' and (l->>'printed_pack')::int = 8 and l->>'carton_code' = carton
                      and (l->>'invoice_unit_cost_ex')::numeric = 24 and jsonb_typeof(l->'candidates') = 'array', l::text);
+  perform pg_temp.ck('list: mixed-department invoice — department per line, card lists both, card department null',
+                     (select cd->'department' = 'null'::jsonb and cd->'departments' = '["Garden", "Grocer"]'::jsonb
+                             and (select jsonb_object_agg(x->>'unmatched_id', x->>'department') from jsonb_array_elements(cd->'lines') x)
+                                 = jsonb_build_object(u9::text, 'Grocer', u10::text, 'Garden')
+                        from jsonb_array_elements(cards) cd where cd->>'source_id' = 'RLTEST-5'),
+                     (select cd::text from jsonb_array_elements(cards) cd where cd->>'source_id' = 'RLTEST-5'));
+  perform pg_temp.ck('list: single-department card keeps its department', (select cd->>'department' = 'Grocer' and cd->'departments' = '["Grocer"]'::jsonb
+                        from jsonb_array_elements(cards) cd where cd->>'source_id' = 'RLTEST-1') and l->>'department' = 'Grocer');
+  perform pg_temp.ck('list: declared STABLE (the database refuses writes from it)',
+                     (select provolatile from pg_proc where proname = 'delivery_retail_lines_list') = 's');
   perform pg_temp.ck('list: café line and other departments', not exists (select 1 from jsonb_array_elements(cards) cd, jsonb_array_elements(cd->'lines') x where (x->>'unmatched_id')::bigint = u6)
                      and exists (select 1 from jsonb_array_elements(cards) cd where cd->>'source_id' = 'RLTEST-3' and cd->>'department' = 'Gift Store'));
   perform pg_temp.ck('candidates: carton barcode match first, ineligible excluded',
@@ -159,7 +184,7 @@ begin
   l := delivery_retail_line_json(u2);
   perform pg_temp.ck('existing: sibling line shows done (booked outside)', l->>'status' = 'done' and l->'answer' = 'null'::jsonb, l::text);
   r2 := delivery_retail_answer(u1, 'existing', jsonb_build_object('stock_item_id', a, 'units', 8, 'confirm', '[]'::jsonb), op1, who);
-  perform pg_temp.ck('existing: same op_id + payload replays',
+  perform pg_temp.ck('retry after an uncertain reply (existing): same op_id replays, nothing booked twice',
                      (r2->>'http')::int = 200 and (r2->'body'->>'replayed')::boolean and (r2->'body'->'line'->>'unmatched_id')::bigint = u1
                      and (select count(*) from stock_ledger where stock_item_id = a) = 2, r2::text);
   r2 := delivery_retail_answer(u1, 'existing', jsonb_build_object('stock_item_id', a, 'units', 9, 'confirm', '[]'::jsonb), op1, who);
@@ -190,9 +215,14 @@ begin
   -- ---------- josh
   r := delivery_retail_answer(u4, 'josh', jsonb_build_object('reason', '   '), gen_random_uuid(), who);
   perform pg_temp.ck('josh: blank reason rejected', r->'body'->>'code' = 'invalid', r::text);
-  r := delivery_retail_answer(u4, 'josh', jsonb_build_object('reason', 'Not sure what this is'), gen_random_uuid(), who);
+  r := delivery_retail_answer(u4, 'josh', jsonb_build_object('reason', 'Not sure what this is'), op3, who);
   perform pg_temp.ck('josh: with_josh', (r->>'http')::int = 200 and r->'body'->>'status' = 'with_josh'
                      and r->'body'->'line'->'answer'->>'reason' = 'Not sure what this is', r::text);
+  r := delivery_retail_answer(u4, 'josh', jsonb_build_object('reason', 'Not sure what this is'), op3, who);
+  perform pg_temp.ck('retry after an uncertain reply (josh): same op_id replays, one answer, one log line',
+                     (r->>'http')::int = 200 and (r->'body'->>'replayed')::boolean
+                     and (select count(*) from delivery_retail_answers where unmatched_id = u4) = 1
+                     and (select count(*) from engine_runs where notes like '%retail line to Josh%RLTest Mystery Item%') = 1, r::text);
 
   -- ---------- new: barcode checks (PR #5 payload shape)
   r := delivery_retail_answer(u3, 'new', jsonb_build_object('units', 12, 'barcode', left(good13, 12) || ((right(good13, 1)::int + 1) % 10), 'no_barcode', false, 'name', '', 'note', '', 'confirm', '[]'::jsonb), gen_random_uuid(), who);
@@ -213,6 +243,7 @@ begin
   perform pg_temp.ck('new: Gift Store with no barcode and no note is allowed', (r->>'http')::int = 200 and r->'body'->>'status' = 'setting_up', r::text);
 
   -- ---------- new: success -> receipt for new-stock-setup
+  update app_config set value = 'live' where key = 'new_stock_mode';      -- u3 is answered with set-up live
   select count(*) into photo_before from jsonb_array_elements(delivery_recent_list(null)->'recent') x where x->>'kind' = 'photo';
   r := delivery_retail_answer(u3, 'new', jsonb_build_object('units', 12, 'barcode', good13, 'no_barcode', false, 'name', '', 'note', '', 'confirm', '[]'::jsonb), op2, who);
   v_receipt := (r->'body'->>'receipt_id')::uuid;
@@ -226,7 +257,7 @@ begin
   perform pg_temp.ck('new: invoice_line receipts stay out of Recent deliveries',
                      (select count(*) from jsonb_array_elements(delivery_recent_list(null)->'recent') x where x->>'kind' = 'photo') = photo_before);
   r2 := delivery_retail_answer(u3, 'new', jsonb_build_object('units', 12, 'barcode', good13, 'no_barcode', false, 'name', '', 'note', '', 'confirm', '[]'::jsonb), op2, who);
-  perform pg_temp.ck('new: replay returns the same receipt, no second receipt', (r2->'body'->>'replayed')::boolean and r2->'body'->>'receipt_id' = op2::text
+  perform pg_temp.ck('retry after an uncertain reply (new): same receipt, no second receipt', (r2->'body'->>'replayed')::boolean and r2->'body'->>'receipt_id' = op2::text
                      and (select count(*) from delivery_receipts where source_id = 'retail-line:' || u3) = 1, r2::text);
 
   -- ---------- new-stock-setup simulation: the reader guesses 10 per carton and returns the carton code as gtin/supplier code
@@ -279,24 +310,73 @@ begin
                      (select result::text from new_stock_lines where id = v_line));
 
   -- ---------- dry_run -> live requeue
-  insert into new_stock_lines (receipt_id, line_no, input, status, result)
-  select x.id, 1, x.submitted_lines->0, 'dry_run', '{"would":"new_item"}' from delivery_receipts x where x.source_id = 'retail-line:' || u5;
-  update delivery_receipts set setup_status = 'dry_run' where source_id = 'retail-line:' || u5;
+  -- u5 (Gift Store) was answered while set-up was in test mode: it must stay a plan until Josh approves it
+  perform pg_temp.ck('test mode: answer records the mode', (select setup_mode from delivery_retail_answers where unmatched_id = u5) = 'dry_run'
+                     and (select submitted_lines->0->>'planned_in_mode' from delivery_receipts where source_id = 'retail-line:' || u5) = 'dry_run');
+  select cc.square_category_id into v_gcat from square_categories cc join square_categories root on root.square_category_id = cc.root_id
+   where cc.category_type = 'REGULAR_CATEGORY' and coalesce(cc.is_deleted, false) = false and canonical_department(root.name) = 'Gift Store' limit 1;
+  insert into new_stock_lines (receipt_id, line_no, input, status, decision, josh_price)
+  select x.id, 1, x.submitted_lines->0, 'pending', jsonb_build_object('action', 'new_item', 'item_name', 'RLTest Candle', 'variation_name', 'Large',
+           'category_id', v_gcat, 'units_per_invoice_unit', 1, 'unit_cost_ex', 15, 'taxable', true, 'supplier_code', 'RLGIFT1',
+           'confidence', 0.95, 'reason', 'test'), 12.5
+    from delivery_receipts x where x.source_id = 'retail-line:' || u5 returning id into v_line;
   update app_config set value = 'dry_run' where key = 'new_stock_mode';
-  perform pg_temp.ck('dry_run: line shows test-mode note', delivery_retail_line_json(u5)->>'status_note' like 'Test mode%');
-  perform delivery_retail_lines_list();
-  perform pg_temp.ck('dry_run: nothing requeued while dry_run', (select setup_status from delivery_receipts where source_id = 'retail-line:' || u5) = 'dry_run');
-  update app_config set value = 'live' where key = 'new_stock_mode';
-  perform delivery_retail_lines_list();
-  perform pg_temp.ck('dry_run: requeued once live', (select setup_status from delivery_receipts where source_id = 'retail-line:' || u5) = 'pending'
-                     and (select l.status from new_stock_lines l join delivery_receipts x on x.id = l.receipt_id where x.source_id = 'retail-line:' || u5) = 'pending');
+  r := new_stock_apply(v_line, true);
+  perform pg_temp.ck('test mode: set-up only plans it', r->>'status' = 'dry_run', r::text);
+  update delivery_receipts set setup_status = 'dry_run' where source_id = 'retail-line:' || u5;
+  l := delivery_retail_line_json(u5);
+  perform pg_temp.ck('test mode: line shows the test-mode note', l->>'status' = 'setting_up' and l->>'status_note' like 'Test mode%'
+                     and not (l->>'needs_promotion')::boolean, l::text);
+  r := delivery_retail_promote(u5, opP, 'Josh');
+  perform pg_temp.ck('promote: refused while set-up is in test mode', (r->>'http')::int = 409 and r->'body'->>'code' = 'setup_test_mode', r::text);
 
-  -- ---------- list after the actions
+  update app_config set value = 'live' where key = 'new_stock_mode';
+  cards := delivery_retail_lines_list()->'cards';
+  perform pg_temp.ck('read-only list: switching set-up to live promotes nothing',
+                     (select setup_status from delivery_receipts where source_id = 'retail-line:' || u5) = 'dry_run'
+                     and (select status from new_stock_lines where id = v_line) = 'dry_run');
+  l := (select x from jsonb_array_elements(cards) cd, jsonb_array_elements(cd->'lines') x where (x->>'unmatched_id')::bigint = u5);
+  perform pg_temp.ck('read-only list: the plan is shown as waiting for Josh', l->>'status' = 'with_josh' and (l->>'needs_promotion')::boolean, l::text);
+  select count(*) into n_sq from rl_square;
+  update new_stock_lines set status = 'pending', result = null where id = v_line;   -- e.g. a sweep re-runs the plan with set-up live
+  r := new_stock_apply(v_line, false);
+  perform pg_temp.ck('guard: a live set-up run on an unpromoted plan stays a dry run, nothing sent to Square',
+                     r->>'status' = 'dry_run' and (select count(*) from rl_square) = n_sq, r::text);
+  update new_stock_lines set status = 'dry_run' where id = v_line;
+
+  r := delivery_retail_promote(u5, opP, 'Josh');
+  perform pg_temp.ck('promote: approved once live', (r->>'http')::int = 200 and r->'body'->>'status' = 'setting_up'
+                     and (r->'body'->'line'->>'unmatched_id')::bigint = u5 and r->'body'->>'receipt_id' is not null
+                     and (select status from new_stock_lines where id = v_line) = 'pending'
+                     and (select (input->>'promoted')::boolean from new_stock_lines where id = v_line)
+                     and (select setup_status from delivery_receipts where source_id = 'retail-line:' || u5) = 'pending', r::text);
+  r2 := delivery_retail_promote(u5, opP, 'Josh');
+  perform pg_temp.ck('promote: retry with the same op_id replays', (r2->>'http')::int = 200 and (r2->'body'->>'replayed')::boolean, r2::text);
+  r2 := delivery_retail_promote(u5, gen_random_uuid(), 'Josh');
+  perform pg_temp.ck('promote: a second approval is refused', (r2->>'http')::int = 409 and r2->'body'->>'code' = 'already_answered', r2::text);
+  r2 := delivery_retail_promote(u4, gen_random_uuid(), 'Josh');
+  perform pg_temp.ck('promote: only test-mode "new" plans can be promoted', (r2->>'http')::int = 404, r2::text);
+
+  r := new_stock_apply(v_line, false);
+  perform pg_temp.ck('promoted plan is created for real (stubbed Square)', r->>'status' = 'square_created', r::text);
+  perform pg_temp.ck('preserved: a priced new product goes to Square as FIXED_PRICING with its price',
+                     exists (select 1 from rl_square q where q.id > n_sq and q.body->'object'->>'type' = 'ITEM'
+                               and q.body->'object'->'item_data'->'variations'->0->'item_variation_data'->>'pricing_type' = 'FIXED_PRICING'
+                               and (q.body->'object'->'item_data'->'variations'->0->'item_variation_data'->'price_money'->>'amount')::int = 1250),
+                     (select string_agg(body::text, ' | ') from rl_square where id > n_sq));
+  r := new_stock_wire(v_line);
+  perform pg_temp.ck('promoted plan books its invoice line', r->>'status' = 'created' and (r->'replay'->>'unmatched_id')::bigint = u5
+                     and delivery_retail_line_json(u5)->>'status' = 'done', r::text);
+  perform pg_temp.ck('preserved: barcode lookup still finds the matched product and its barcode',
+                     (delivery_line_known(SUP, 'Grocer', jsonb_build_array(jsonb_build_object('description', 'RLTest Crackers Original 250g (8)')))->0->>'stock_item_id')::bigint = a
+                     and delivery_line_known(SUP, 'Grocer', jsonb_build_array(jsonb_build_object('description', 'RLTest Crackers Original 250g (8)')))->0->>'upc' = inner13,
+                     delivery_line_known(SUP, 'Grocer', jsonb_build_array(jsonb_build_object('description', 'RLTest Crackers Original 250g (8)')))::text);
+
   cards := delivery_retail_lines_list()->'cards';
   perform pg_temp.ck('list: statuses after actions',
     (select jsonb_object_agg(x->>'unmatched_id', x->>'status') from jsonb_array_elements(cards) cd, jsonb_array_elements(cd->'lines') x
       where (x->>'unmatched_id')::bigint in (u1, u2, u3, u4, u5, u7, u8))
-    = jsonb_build_object(u1::text, 'done', u2::text, 'done', u3::text, 'done', u4::text, 'with_josh', u5::text, 'setting_up', u7::text, 'open', u8::text, 'with_josh'),
+    = jsonb_build_object(u1::text, 'done', u2::text, 'done', u3::text, 'done', u4::text, 'with_josh', u5::text, 'done', u7::text, 'open', u8::text, 'with_josh'),
     (select jsonb_object_agg(x->>'unmatched_id', x->>'status') from jsonb_array_elements(cards) cd, jsonb_array_elements(cd->'lines') x)::text);
   perform pg_temp.ck('list: open counts', (select (cd->>'open')::int from jsonb_array_elements(cards) cd where cd->>'source_id' = 'RLTEST-1') = 1);
 
@@ -308,6 +388,5 @@ end $T$;
 
 do $$ begin
   raise exception 'RL-RESULTS %', (select jsonb_build_object('passed', count(*) filter (where ok), 'failed', count(*) filter (where not ok),
-    'failures', coalesce(jsonb_agg(jsonb_build_object('n', n, 'name', name, 'detail', left(detail, 600)) order by n) filter (where not ok), '[]'),
-    'names', jsonb_agg(name order by n)) from rl_t);
+    'failures', coalesce(jsonb_agg(jsonb_build_object('n', n, 'name', name, 'detail', left(detail, 600)) order by n) filter (where not ok), '[]')) from rl_t);
 end $$;

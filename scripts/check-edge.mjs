@@ -14,11 +14,11 @@ const dir = new URL('../supabase/functions/delivery-app/', import.meta.url);
 const FILES = ['index.ts', 'auth.ts', 'receipts.ts', 'tags.ts', 'retail.ts'];
 const KEYS = ['index', 'auth', 'receipts', 'tags', 'retail'];  // SOURCE_SHA keys, same order as FILES
 const REQUIRED = {
-  'index.ts': ['Deno.serve(', 'from "./auth.ts"', 'export const BUILD = "', 'export const SOURCE_SHA = {', '"/health"', '"/deliveries"', 'retailRoute(', 'from "./retail.ts"',
+  'index.ts': ['Deno.serve(', 'from "./auth.ts"', 'export const BUILD = "', 'export const SOURCE_SHA = {', '"/health"', '"/deliveries"', 'retailRoute(', 'retailOwnerRoute(', 'from "./retail.ts"',
                '"/recent-deliveries"', '"/prices/all"', '"/recent"', '"/suppliers"', '"/receipts"', 'op_id', 'ConfigUnavailable', 'whoFromHeaders', 'from "./receipts.ts"', 'from "./tags.ts"', 'confirmTag(', 'price_op_resolve'],
   'auth.ts': ['export class ConfigUnavailable', 'export function makeCfg', 'export async function whoFromHeaders'],
   'tags.ts': ['export async function confirmTag', 'delivery_tag_claim', 'delivery_tag_apply', 'missingClaimFunction'],
-  'retail.ts': ['export async function retailRoute', 'delivery_retail_answer', 'delivery_retail_lines_list', 'delivery_retail_search'],
+  'retail.ts': ['export async function retailRoute', 'export async function retailOwnerRoute', 'delivery_retail_answer', 'delivery_retail_lines_list', 'delivery_retail_search', 'delivery_retail_promote', 'uncertain'],
   'receipts.ts': ['export async function createReceipt', 'export async function reconcileReceipt', 'status: "uploading"', 'upload_failed'],
 };
 const MIN_BYTES = { 'index.ts': 15000, 'auth.ts': 1500, 'receipts.ts': 5000, 'tags.ts': 1000, 'retail.ts': 1500 };
