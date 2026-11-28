@@ -62,5 +62,10 @@ if [ "$SUITES" = all ] || [ "$SUITES" = fixedprice ]; then
   conn="dbname=poppies_square_mock host=${PGHOST:-/tmp} port=${PGPORT:-5432} user=${PGUSER:-postgres}"
   out=$(psql -X -q -v mock_conn="$conn" -d poppies_tfp -f tests/pricing_03_selftest.sql 2>&1); count "$out" "pricing_03 with fixed-pricing writers"
   out=$(psql -X -q -d poppies_tfp -f tests/price_write_fixed_pricing.sql 2>&1); count "$out" "fixed-pricing writers"
+  # 28 Nov 2026: lock Square-reaching invoker functions to postgres + service_role
+  $P -d poppies_tfp -f tests/local/square_writers_stubs.sql >/dev/null
+  $P -1 -d poppies_tfp -f migrations/20261128_square_writers_lockdown.sql >/dev/null || { echo "lockdown migration did not apply"; exit 1; }
+  $P -1 -d poppies_tfp -f migrations/20261128_pricing_invoker_lockdown.sql >/dev/null || { echo "pricing invoker lockdown did not apply"; exit 1; }
+  out=$(psql -X -q -d poppies_tfp -f tests/square_writers_lockdown.sql 2>&1); count "$out" "square writers lockdown"
 fi
 exit $fail

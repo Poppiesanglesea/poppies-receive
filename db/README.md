@@ -8,6 +8,8 @@
 | `migrations/20261126_pricing_03_tag_confirm.sql` (rev 2) | **Staged, not applied** — validated locally |
 | `rollback/20261126_pricing_03_tag_confirm_rollback.sql` | Validated locally (refuses while a register update is in flight or in doubt; keeps audit + operation evidence) |
 | `migrations/20261128_price_write_fixed_pricing.sql` | **Applied live 28 Nov 2026** (`price_write_fixed_pricing`): `price_square_put` and `square_set_variation_price` set `pricing_type = FIXED_PRICING` with the price; backups `*_bak_20261128` (postgres only). Tests: `tests/price_write_fixed_pricing.sql` (`run_local.sh fixedprice`) |
+| `migrations/20261128_square_writers_lockdown.sql` | **Applied live 28 Nov 2026** (`square_writers_lockdown`): 11 Square-reaching invoker functions (incl. `square_set_variation_price`, `sync_part_variation_prices`) locked to postgres + service_role; `square_api` restated postgres-only; guard `square_writer_exposure()` (must return no rows) |
+| `migrations/20261128_pricing_invoker_lockdown.sql` | **Applied live 28 Nov 2026** (`pricing_invoker_lockdown`): `nightly_close`, `price_proposal_decide`, `produce_price_label` locked to postgres + service_role; `delivery_app_selfcheck()` now reports none exposed |
 | `tests/run_local.sh` | Reproducible local run of everything below (disposable PostgreSQL 16+ with dblink) |
 
 Applied directly (narrowing / read-only, before or alongside this folder): app RPC privilege narrowing,
