@@ -225,7 +225,7 @@ function retailScreen(sid, message = "") {
   S.delivery = sid;
   $(`<h2>${esc(c.supplier)} · ${esc(c.invoice_number)}</h2><p>${esc(c.department)} · ${esc(dday(c.invoice_date))}</p>
     ${message ? `<p class="note">${esc(message)}</p>` : ""}
-    ${c.lines.map(l => `<div class="card"><b>${esc(l.description)}</b><p class="muted">Invoiced quantity ${esc(l.qty)} ${esc(l.unit)}${l.invoice_unit_cost_ex != null ? " · " + money(l.invoice_unit_cost_ex) + " ex GST per invoice unit" : ""}</p>
+    ${c.lines.map(l => `<div class="card"><b>${esc(l.description)}</b><p class="muted">${l.department ? esc(l.department) + " · " : ""}Invoiced quantity ${esc(l.qty)} ${esc(l.unit)}${l.invoice_unit_cost_ex != null ? " · " + money(l.invoice_unit_cost_ex) + " ex GST per invoice unit" : ""}</p>
       ${l.status === "open" ? `<div class="row">${[["existing","Match existing product"],["new","Set up new product"],["josh","Ask Josh"]].map(([action,label]) => `<button class="secondary" onclick="openRetail(${Number(l.unmatched_id)},'${action}')">${label}</button>`).join("")}</div>` : esc(retailStatus(l))}</div>`).join("")}
     <button class="secondary" onclick="homeScreen()">Back to deliveries</button>`);
 }
@@ -236,11 +236,12 @@ function openRetail(id, action) {
   const card = RETAIL.cards.find(c => c.source_id === S.delivery);
   const line = card?.lines.find(l => l.unmatched_id === id && l.status === "open");
   if (!line) return homeScreen();
-  retailForm = { id, action, card, op: newOp(), pending: false, confirm: null, searchSeq: 0 };
+  const department = line.department || card.department;
+  retailForm = { id, action, card, department, op: newOp(), pending: false, confirm: null, searchSeq: 0 };
   $(`<h2>${esc(line.description)}</h2><p>${esc(card.supplier)} · ${esc(card.invoice_number)}</p>
    <form id="retail-form" onsubmit="saveRetail();return false" oninput="clearRetailWarning()">
    <fieldset id="retail-fields" style="border:0;padding:0">
-   ${action === "existing" ? `<h3>Match existing product</h3>${retailOptions(line.candidates || [])}
+   ${action === "existing" ? `<h3>Match existing product</h3><p>This saves the match and pack size for future invoices. It can also book other waiting lines from this supplier with the same description.</p>${retailOptions(line.candidates || [])}
    <div class="row"><input id="retail-query" placeholder="Search eligible products" aria-label="Search eligible products"><button type="button" class="secondary" onclick="retailSearch()">Search</button></div><div id="retail-results"></div>` : ""}
    ${action !== "josh" ? `<p><label>How many sellable units came in <b>one</b> invoice unit? <input required type="number" inputmode="numeric" min="1" max="500" step="1" id="retail-units"></label></p>
    ${line.printed_pack != null ? `<p class="muted">The invoice suggests ${esc(line.printed_pack)}. Check the pack on the bench.</p>` : ""}` : ""}
@@ -248,7 +249,7 @@ function openRetail(id, action) {
    <label>Barcode on one sellable item <input id="retail-barcode" inputmode="numeric"></label>
    <button type="button" class="secondary" onclick="scanRetail()">Scan item</button><p class="muted">Use the barcode on the individual product. Leave the carton barcode on the invoice.</p>
    <label><input id="retail-no-code" type="checkbox" style="width:auto" onchange="toggleRetailBarcode()"> This item has no barcode</label>
-   <p><label>Setup note${card.department === "Grocer" ? " (required if there’s no barcode)" : " (optional)"} <input id="retail-note"></label></p>
+   <p><label>Setup note${department === "Grocer" ? " (required if there’s no barcode)" : " (optional)"} <input id="retail-note"></label></p>
    ${RETAIL.new_stock_mode === "dry_run" ? '<p class="note">Test mode. This plans the new product without creating it in Square.</p>' : ""}` : ""}
    ${action === "josh" ? '<p><label>What should Josh check? <input required id="retail-reason" maxlength="300"></label></p>' : ""}
    <label>Checked by <select required id="retail-by"><option value="">Choose your name</option>${(RETAIL.staff || []).map(n => `<option ${n === WHO ? "selected" : ""}>${esc(n)}</option>`).join("")}</select></label>
@@ -301,7 +302,7 @@ async function saveRetail() {
       body.barcode = body.no_barcode ? "" : val("barcode");
       body.name = val("name"); body.note = val("note");
       if (!body.no_barcode && !body.barcode) { msg.textContent = "Scan the sellable item, or mark that it has no barcode."; return; }
-      if (body.no_barcode && f.card.department === "Grocer" && !body.note) { msg.textContent = "Explain why this grocery item has no barcode."; return; }
+      if (body.no_barcode && f.department === "Grocer" && !body.note) { msg.textContent = "Explain why this grocery item has no barcode."; return; }
     }
     const signature = JSON.stringify(body);
     body.confirm = f.confirm?.signature === signature ? f.confirm.codes : [];
