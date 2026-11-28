@@ -48,4 +48,19 @@ if [ "$SUITES" = all ] || [ "$SUITES" = pricing ]; then
     out=$(psql -X -q -d $D -f tests/pricing_03_rollback_checks.sql 2>&1); count "$out" "pricing_03 rollback"
   fi
 fi
+
+# 28 Nov 2026: Square price writers set FIXED_PRICING (migrations/20261128_price_write_fixed_pricing.sql), applied on
+# top of 03; the 03 selftest is re-run with it in place, then the writers are exercised against a recording stub.
+if [ "$SUITES" = all ] || [ "$SUITES" = fixedprice ]; then
+  F=migrations/20261128_price_write_fixed_pricing.sql
+  fresh poppies_tfp; dropdb --if-exists poppies_square_mock >/dev/null; createdb poppies_square_mock
+  $P -d poppies_square_mock -f tests/local/square_mock_store.sql >/dev/null
+  $P -d poppies_tfp -c "create extension if not exists dblink" >/dev/null
+  $P -1 -d poppies_tfp -f migrations/20261126_provenance_02_schema.sql >/dev/null
+  $P -1 -d poppies_tfp -f "$M03" >/dev/null || { echo "03 did not apply"; exit 1; }
+  $P -1 -d poppies_tfp -f "$F" >/dev/null || { echo "fixed-pricing migration did not apply"; exit 1; }
+  conn="dbname=poppies_square_mock host=${PGHOST:-/tmp} port=${PGPORT:-5432} user=${PGUSER:-postgres}"
+  out=$(psql -X -q -v mock_conn="$conn" -d poppies_tfp -f tests/pricing_03_selftest.sql 2>&1); count "$out" "pricing_03 with fixed-pricing writers"
+  out=$(psql -X -q -d poppies_tfp -f tests/price_write_fixed_pricing.sql 2>&1); count "$out" "fixed-pricing writers"
+fi
 exit $fail
