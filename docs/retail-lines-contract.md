@@ -113,6 +113,8 @@ waiting line.
 ```
 `units`: sellable units in ONE invoice unit, integer 1–500. On success books the line (and any other open line of the
 same supplier with the identical description, on any invoice), saves the mapping with that pack, returns status `done`.
+If one of those other lines already has a `new` answer (set-up planned or in progress), nothing is booked and the reply is
+409 `sibling_in_setup` with the line: match it once that product is in Square, or send it to Josh (28 Nov 2026 review).
 If the line does not book, everything is undone and the reply is 400 `booking_failed` (nothing recorded; the same
 `op_id` may be re-sent, or the line sent to Josh).
 

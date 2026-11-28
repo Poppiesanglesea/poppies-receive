@@ -21,6 +21,14 @@
 -- No change to stock, invoices, prices, mappings or Square on apply.
 -- Rollback: db/rollback/20261128_retail_lines_01_rollback.sql
 
+-- re-run guard (28 Nov 2026 review): a second run would overwrite the 'pre-retail-lines-2026-11-28' rollback point with
+-- this migration's own definitions. The rollback drops delivery_retail_answer, so re-applying after a rollback still works.
+do $rerun$ begin
+  if to_regprocedure('public.delivery_retail_answer(bigint,text,jsonb,uuid,text)') is not null then
+    raise exception 'retail_lines_01 refused: it is already applied (delivery_retail_answer exists). Roll it back first to re-apply.';
+  end if;
+end $rerun$;
+
 -- 0. backups (restorable with fn_backup_restore(fn, 'pre-retail-lines-2026-11-28'))
 insert into public.function_backup (label, fn_name, signature, definition)
 select 'pre-retail-lines-2026-11-28', p.proname, p.oid::regprocedure::text, pg_get_functiondef(p.oid)
@@ -429,6 +437,20 @@ begin
     end if;
 
     if p_action = 'existing' then
+      -- Siblings (28 Nov 2026 review): map_unmatched also books every other open line of this supplier with the identical
+      -- description, on any invoice. Lock them (id order), and refuse while any of them already has a 'new' answer: booking
+      -- it here would attach that line to this product while its own set-up may still create a separate Square product.
+      perform 1 from ingest_unmatched x
+       where x.id <> u.id and x.resolved_at is null and x.description = u.description
+         and canonical_supplier(x.supplier) = canonical_supplier(u.supplier)
+       order by x.id for update;
+      if exists (select 1 from ingest_unmatched x join delivery_retail_answers ra on ra.unmatched_id = x.id
+                  where x.id <> u.id and x.resolved_at is null and x.description = u.description
+                    and canonical_supplier(x.supplier) = canonical_supplier(u.supplier) and ra.action = 'new') then
+        return jsonb_build_object('http', 409, 'body', jsonb_build_object('ok', false, 'code', 'sibling_in_setup',
+          'error', 'The same product on another delivery is already being set up as a new product. Wait until it is in Square, then match this line to it, or send this line to Josh.',
+          'line', delivery_retail_line_json(p_unmatched_id)));
+      end if;
       begin  -- savepoint: the mapping is undone if this line does not book
         v_map := map_unmatched(u.id, v_item, v_units * coalesce(nullif(s.grams_per_count_unit, 0), 1), null, null, false, null);
         if coalesce(v_map->>'status', '') <> 'mapped' or not exists (select 1 from ingest_unmatched x where x.id = u.id and x.resolved_at is not null) then
