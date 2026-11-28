@@ -99,6 +99,9 @@ function noKey(){ $(`<h2>This iPad isn't set up yet</h2><p>Ask Josh to open the 
 let idleT; function idle(){ clearTimeout(idleT); idleT = setTimeout(() => { if (!S.receipt) homeScreen(); }, 15*60*1000); }
 async function homeScreen() {
   if (!KEY && !OWNER) return noKey();
+  // Leaving the line check: the delivery can be reopened from Recent deliveries, but edits made here are lost.
+  if (S.receipt && REC && REC.id === S.receipt && document.getElementById("go") && typeof confirm === "function"
+      && !confirm("Leave this delivery without sending it? You can reopen it from Recent deliveries, but changes made here will be lost.")) return;
   if (S.photos.length && !S.receipt) DRAFT = { dept: S.dept, supplier: S.supplier, photos: S.photos, op: S.op, uncertain: !!S.uncertain };
   S = { dept: S.dept, supplier: null, photos: [], receipt: null }; WHO = null;
   $(`${DRAFT ? `<div class="note" style="margin:0 0 14px"><b>Unsent photos</b> for ${esc(DRAFT.supplier)} (${DRAFT.photos.length} photo${DRAFT.photos.length === 1 ? "" : "s"})${DRAFT.uncertain ? " — the last send may have arrived; check Recent deliveries below. Sending again won't create a second copy." : "."}
@@ -355,7 +358,10 @@ function rdRow(x) {
   const what = x.kind === "photo"
     ? `<span class="tag">photo</span> ${esc(p ? label(p) : "set-up")}`
     : `${x.invoice_number ? "#" + esc(x.invoice_number) + " · " : ""}${x.lines} line${x.lines === 1 ? "" : "s"}${x.booked != null && x.booked < x.lines ? ` · ${x.booked} booked` : ""}${x.waiting ? ` · <b style="color:var(--warn)">${x.waiting} waiting</b>` : ""}${x.open_jobs ? ` · <b style="color:var(--warn)">${x.open_jobs} job${x.open_jobs === 1 ? "" : "s"} open</b>` : ""}`;
-  const tap = x.kind === "photo" && p && p.status === "submitted" ? ` onclick="itemsScreen(${ja(x.id)})" style="cursor:pointer"` : "";
+  // Sent deliveries open their products; ones still being read or waiting for a check reopen so they can be finished.
+  const tap = x.kind !== "photo" || !p ? ""
+    : p.status === "submitted" ? ` onclick="itemsScreen(${ja(x.id)})" style="cursor:pointer"`
+    : p.status === "ready" || p.status === "reading" ? ` onclick="openReceipt(${ja(x.id)})" style="cursor:pointer"` : "";
   const waiting = x.kind === "invoice" && RETAIL.cards.some(c => c.source_id === x.id && c.open > 0);
   const review = waiting ? ` <button class="secondary small" onclick="retailScreen(${ja(x.id)})">Review waiting lines</button>` : "";
   return `<div${tap}><span>${esc(x.supplier || "Unknown supplier")} <span class="muted">· ${esc((x.depts || []).join(", "))}</span></span><span class="muted" style="text-align:right">${what} · ${dayFmt(x.date)}${review}</span></div>`;
@@ -547,7 +553,17 @@ function ownerButtons(t) {
   const quick = t.kind === "hold" ? `<button class="primary small" onclick="decide(${t.id},'approve',${Number(i.new)})">Change to ${money(i.new)}</button>
       <button class="secondary small" onclick="decide(${t.id},'keep')">Keep ${money(i.old)}</button>` : "";
   return `<div class="muted">${t.kind === "hold" ? `Worked-out price ${money(i.new)} (${Math.round(Math.abs(Number(i.pct) || 0))}% change)${i.failed ? " — Square didn't take it last time" : ""}` : "Set a shelf price"}</div>
-    <div class="row" style="margin-top:6px">${quick}<input id="p${t.id}" inputmode="decimal" placeholder="Other price" style="max-width:140px"><button class="secondary small" onclick="decide(${t.id},'approve',document.getElementById('p${t.id}').value)">Set</button></div>`;
+    <div class="row" style="margin-top:6px">${quick}<input id="p${t.id}" inputmode="decimal" placeholder="Other price" style="max-width:140px"><button class="secondary small" onclick="decideTyped(${t.id})">Set</button></div>`;
+}
+// "Set" uses only the price Josh typed. An empty or unreadable box must never fall back to the worked-out price.
+function decideTyped(id) {
+  const raw = String(document.getElementById("p" + id).value || "").trim().replace(/^\$\s*/, "");
+  const ok = /^\d+(\.\d{1,2})?$/.test(raw) && Number(raw) > 0 && Number(raw) < 10000;
+  if (!ok) {
+    const msg = { ok: false, text: raw ? "That price isn't a number like 4.50." : "Type the new price first, then tap Set." };
+    return S.view === "josh" ? joshScreen(msg) : deliveryScreen(S.delivery, msg);
+  }
+  return decide(id, "approve", Number(raw));
 }
 async function decide(id, decision, price) {
   const res = await api(`/owner/tasks/${id}/decide`, { method: "POST", body: JSON.stringify({ decision, price: price === undefined ? null : price }) });
@@ -748,7 +764,21 @@ async function readingScreen() {
     if (r.body.status === "ready") return linesScreen(r.body);
     if (r.body.status === "error") return $(`<h2>Couldn't read it</h2><div class="note err">${esc(r.body.hold_reason || "Unknown problem")}</div><p>The photos are saved. Leave the paperwork for Josh.</p><button class="primary" onclick="homeScreen()">Done</button>`);
   }
-  $(`<h2>Still reading</h2><p>It's taking longer than usual. It'll show under Recent deliveries when it's ready.</p><button class="primary" onclick="homeScreen()">OK</button>`);
+  $(`<h2>Still reading</h2><p>It's taking longer than usual. When Recent deliveries shows it as "waiting for a check", tap it to check the lines and send it.</p><button class="primary" onclick="homeScreen()">OK</button>`);
+}
+// Reopen a photo delivery from Recent deliveries (still being read, or read and waiting for its lines to be checked).
+async function openReceipt(id) {
+  S.receipt = id;
+  $(`<h2>Opening…</h2><div class="spinner"></div>`);
+  const v = VIEW, r = await api("/receipts/" + id);
+  if (v !== VIEW) return;
+  if (!r.ok) { S.receipt = null; return $(`<h2>Couldn't open it</h2><div class="note err">${esc((r.body && r.body.error) || "Try again in a minute.")}</div><button class="secondary" onclick="homeScreen()">Back</button>`); }
+  if (r.body.status === "ready") return linesScreen(r.body);
+  if (r.body.status === "reading") return readingScreen();
+  S.receipt = null;
+  if (r.body.status === "submitted") return itemsScreen(id);
+  if (r.body.status === "error") return $(`<h2>Couldn't read it</h2><div class="note err">${esc(r.body.hold_reason || "Unknown problem")}</div><p>The photos are saved. Leave the paperwork for Josh.</p><button class="primary" onclick="homeScreen()">Done</button>`);
+  homeScreen();
 }
 
 // ---------- lines
@@ -883,7 +913,7 @@ async function submitLines() {
    <p>New products will be added to Square automatically. When this delivery shows <b>"in Square — print labels"</b> under Recent deliveries, print the shelf tags and plant labels from Square.</p>
    <p class="muted">Keep the paperwork with the others as usual.</p><button class="primary" onclick="homeScreen()">Done</button>`);
 }
-async function cancelRec(){ await api(`/receipts/${REC.id}/cancel`, { method: "POST" }); homeScreen(); }
+async function cancelRec(){ await api(`/receipts/${REC.id}/cancel`, { method: "POST" }); S.receipt = null; homeScreen(); }
 
 document.addEventListener("click", idle); document.addEventListener("input", idle);
 homeScreen();

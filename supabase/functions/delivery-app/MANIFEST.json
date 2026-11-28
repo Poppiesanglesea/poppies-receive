@@ -1,14 +1,14 @@
 {
-  "build": "delivery-app v19 2026-11-28 retail-lines",
+  "build": "delivery-app v20 2026-11-28 review-fixes",
   "source_sha": {
-    "index": "81f76bfde5ea97551ad87cb78279ebc2167ff2c072bff432c65841103ebb9a91",
+    "index": "563d4c68542a5b117dfb83ef2394dd262a6e8767e1da9b0a738a1a61a3b1169e",
     "auth": "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331",
     "receipts": "0bbd4a7723ef2f7b146ac729ab08c45034a4d6dd04fecb3ef6c1adf72f199afe",
     "tags": "0866c0de5065b546c54c8211853388e3316ec5fa4d297f70f12f30c2ed340c3d",
     "retail": "ba5b57337b58cc61ffd90daf4586f78be1f510168961cd21505e40e9362b6ff8"
   },
   "file_sha256": {
-    "index.ts": "a50f0475e963a7616fc42e7bff4233129fca45ec8ad15b70100a893e41f63662",
+    "index.ts": "df46ccba1a7d956738b232645a46631c6a299f4d4be81c25c27fb178f98e37d2",
     "auth.ts": "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331",
     "receipts.ts": "0bbd4a7723ef2f7b146ac729ab08c45034a4d6dd04fecb3ef6c1adf72f199afe",
     "tags.ts": "0866c0de5065b546c54c8211853388e3316ec5fa4d297f70f12f30c2ed340c3d",

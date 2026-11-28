@@ -28,6 +28,9 @@ echo "$res" | python3 tests/local/pr_report.py || fail=1
 $P -d "$D" -f tests/pricing_repair_seed.sql >/dev/null
 seeded=$(h)
 $P -1 -d "$D" -f migrations/20261128_pricing_repair_01.sql >/dev/null && echo "pass: migration applies" || { echo "FAIL: migration apply"; fail=1; }
+# rollback order (28 Nov review): the 03 rollback would drop price_item_lock / price_propose that the repair uses
+if $P -1 -d "$D" -f rollback/20261126_pricing_03_tag_confirm_rollback.sql >/dev/null 2>&1; then echo "FAIL: 03 rollback ran while the repair is applied"; fail=1;
+else echo "pass: 03 rollback refuses while the repair is applied"; fi
 $P -1 -d "$D" -f rollback/20261128_pricing_repair_01_rollback.sql >/dev/null && echo "pass: rollback runs" || { echo "FAIL: rollback"; fail=1; }
 psql -X -q -d "$D" -c "drop table produce_price_attempts_archived; delete from function_backup where label = 'pre-pricing-repair-2026-11-28'" >/dev/null
 [ "$(h)" = "$seeded" ] && echo "pass: rollback restores every definition byte-for-byte" || { echo "FAIL: rollback left differences"; fail=1; }

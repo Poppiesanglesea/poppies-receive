@@ -23,6 +23,8 @@
 //   GET /retail-lines/:id/search, POST /retail-lines/:id/(existing|new|josh). "new" hands the line to new-stock-setup.
 //   Rev 2: browsing is read-only (no sweep, no requeue); POST /owner/retail-lines/:id/promote (owner key) approves a
 //   product planned while set-up was in test mode. /recent lists only photo receipts (origin = 'photo').
+// v20 (28 Nov 2026, review fixes): POST /owner/tasks/:id/decide refuses approve with a blank typed price ("") instead of
+//   letting the database fall back to the worked-out price. A null/absent price (quick buttons, box sizes) is unchanged.
 // v16 (26 Nov 2026): POST /receipts accepts a client op_id (uuid) and uses it as the receipt id, so re-sending the same
 //   photo set after an uncertain failure returns the existing receipt instead of creating a duplicate delivery.
 import { createClient } from "jsr:@supabase/supabase-js@2";
@@ -32,9 +34,9 @@ import { createReceipt, reconcileReceipt, type Deps, type Receipt } from "./rece
 import { confirmTag, type RpcErr } from "./tags.ts";
 import { retailOwnerRoute, retailRoute } from "./retail.ts";
 
-export const BUILD = "delivery-app v19 2026-11-28 retail-lines";
+export const BUILD = "delivery-app v20 2026-11-28 review-fixes";
 // SOURCE_SHA is written by scripts/check-edge.mjs --write: sha-256 of index.ts (with this one line removed), auth.ts, receipts.ts, tags.ts and retail.ts.
-export const SOURCE_SHA = { index: "81f76bfde5ea97551ad87cb78279ebc2167ff2c072bff432c65841103ebb9a91", auth: "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331", receipts: "0bbd4a7723ef2f7b146ac729ab08c45034a4d6dd04fecb3ef6c1adf72f199afe", tags: "0866c0de5065b546c54c8211853388e3316ec5fa4d297f70f12f30c2ed340c3d", retail: "ba5b57337b58cc61ffd90daf4586f78be1f510168961cd21505e40e9362b6ff8" };
+export const SOURCE_SHA = { index: "563d4c68542a5b117dfb83ef2394dd262a6e8767e1da9b0a738a1a61a3b1169e", auth: "1c3f2f3fbdcffb50d150df19e7aef3c67cc6292d9d8a09e37ccd235c63e52331", receipts: "0bbd4a7723ef2f7b146ac729ab08c45034a4d6dd04fecb3ef6c1adf72f199afe", tags: "0866c0de5065b546c54c8211853388e3316ec5fa4d297f70f12f30c2ed340c3d", retail: "ba5b57337b58cc61ffd90daf4586f78be1f510168961cd21505e40e9362b6ff8" };
 
 const URL_ = Deno.env.get("SUPABASE_URL")!;
 const SB = createClient(URL_, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
@@ -209,6 +211,8 @@ Deno.serve(async (req) => {
         const b = await req.json().catch(() => ({}));
         const decision = b.decision === "keep" ? "keep" : b.decision === "approve" ? "approve" : "";
         if (!decision) return json({ error: "approve or keep" }, 400);
+        // A blank typed price is not "use the suggestion": only an absent/null price means that (quick buttons, box sizes).
+        if (decision === "approve" && typeof b.price === "string" && !b.price.trim()) return json({ error: "Type the new price first." }, 400);
         const price = b.price === "" || b.price == null ? null : Number(b.price);
         if (price !== null && !(price > 0 && price < 10000)) return json({ error: "Enter a price above 0." }, 400);
         const { data, error } = await SB.rpc("delivery_owner_decide", { p_task_id: Number(om[1]), p_decision: decision, p_price: price, p_by: "Josh" });
