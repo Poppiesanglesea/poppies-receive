@@ -176,3 +176,28 @@ test('a practice delivery says clearly that nothing changes', async () => {
   assert.match(a.el('app').innerHTML, /PRACTICE DELIVERY/);
   assert.doesNotMatch(a.el('app').innerHTML, /Prices are already changed in Square/);
 });
+
+test('changing a warned count or product requires a fresh recount before booking', async () => {
+  const choice = {value:'1860',dataset:{unit:'each',last:'36'}};
+  const a = app({checked:choice,count:'12'});
+  await a.run('fetchDeliveries()');
+  a.run("deliveryScreen('inv-1'); WHO='Fern'");
+  a.run('saveCount(2)');
+  a.el('n2').value = '9';
+  a.run('saveCount(2)');
+  assert.equal(a.requests.filter(r => r.url.endsWith('/count')).length, 0);
+  choice.value = '22';
+  a.run('saveCount(2)');
+  assert.equal(a.requests.filter(r => r.url.endsWith('/count')).length, 0);
+  await a.run('saveCount(2)');
+  assert.deepEqual(a.requests.find(r=>r.url.endsWith('/count')).body,{stock_item_id:22,count:9,by:'Fern'});
+});
+
+test('failed produce product search asks staff to retry', async () => {
+  const a = app();
+  a.run("api = async () => ({ok:false,status:503,body:{error:'Unavailable'}})");
+  a.el('q2').value='leek';
+  await a.run('searchItems(2)');
+  assert.match(a.el('cs2').innerHTML,/try again/i);
+  assert.doesNotMatch(a.el('cs2').innerHTML,/nothing found/i);
+});
