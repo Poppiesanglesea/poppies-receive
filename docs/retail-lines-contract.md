@@ -152,4 +152,4 @@ code printed on the invoice is usually the carton barcode.
 - Josh's screen for `with_josh` lines from action "josh" (he sorts them in a Claude chat for now; set-up questions
   still appear in his existing "products waiting" list).
 - Repricing after "existing" (retail prices follow the RRP rules, not produce auto-pricing).
-- The historical gingerbread booking (separate proposal for Josh).
+- Correcting historical mis-bookings (separate proposal for Josh, restricted record).
